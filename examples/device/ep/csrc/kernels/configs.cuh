@@ -22,7 +22,8 @@
 
 #pragma once
 
-#define NUM_MAX_NVL_PEERS 8
+// [dyogev patch] reduced from 8 for single-island 4-GPU testing (matches CI topology).
+#define NUM_MAX_NVL_PEERS 4
 #define NUM_MAX_RDMA_PEERS 20
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024

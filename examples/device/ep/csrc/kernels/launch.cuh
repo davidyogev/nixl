@@ -88,6 +88,7 @@ cfg.dynamicSmemBytes = smem_size;
 
 #define SWITCH_RDMA_RANKS(case_macro) \
     switch (num_ranks / NUM_MAX_NVL_PEERS) { \
+        case 1: case_macro(1); /* [dyogev patch] single-island (num_rdma_ranks=1) run */ \
         case 2: case_macro(2); \
         case 4: case_macro(4); \
         case 8: case_macro(8); \

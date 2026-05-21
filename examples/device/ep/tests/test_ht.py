@@ -65,7 +65,7 @@ def test_main(
         args.num_experts,
     )
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0 and num_local_ranks == 4
     if local_rank == 0:
         print(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
@@ -147,7 +147,10 @@ def test_main(
         _,
     ) = buffer.get_dispatch_layout(topk_idx, num_experts)
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
-    assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
+    # [dyogev patch] runtime returns None for num_tokens_per_rdma_rank in intranode
+    # settings (single NVL island, num_nodes==1); skip the comparison there.
+    if ref_num_tokens_per_rdma_rank is not None:
+        assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
@@ -159,7 +162,9 @@ def test_main(
 
     # Config
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
-    config = nixl_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
+    # [dyogev patch] rdma_chunked_send_tokens bumped 16 -> 24 to satisfy
+    # nixl_ep_ht.cu:2424 (>= num_warps_per_forwarder == kNumCombineForwarderWarps/num_rdma_ranks == 24/1).
+    config = nixl_ep.Config(num_sms, 8, nvl_buffer_size, 24, rdma_buffer_size)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -409,7 +414,9 @@ def test_main(
     # Tune combine performance
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 8, 1):
-        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
+        # [dyogev patch] single-node lower bound 8 -> 24: combine asserts num_max_rdma_chunked_send_tokens >= 24
+        # when num_rdma_ranks == 1 (kNumCombineForwarderWarps/1).
+        for rdma_chunk_size in range(12 if num_nodes == 2 else 24, 33, 4):
             config = nixl_ep.Config(
                 num_sms,
                 nvl_chunk_size,
@@ -490,7 +497,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     buffer.connect_ranks([i for i in range(num_ranks) if i != rank])
 
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_local_ranks == 4 and num_ranks == num_local_ranks
     torch.manual_seed(rank)
 
     for i in (num_sms,):

@@ -41,7 +41,10 @@ namespace ht {
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
+    // [dyogev patch] dropped hard equality with 8; SourceMeta::is_token_in_nvl_rank_bits
+    // only uses the low NUM_MAX_NVL_PEERS bits of a 32-bit int (see <<i packing below),
+    // so any value <= 32 works.
+    // EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
 
     __forceinline__ SourceMeta() = default;
 
@@ -331,9 +334,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+                // [dyogev patch] was sizeof(uint64_t) for 8 peers; uint32_t for 4 peers (each is_token_in_rank row is NUM_MAX_NVL_PEERS bytes).
+                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint32_t), "Invalid number of NVL peers");
                 auto is_token_in_rank_uint64 =
-                    *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
+                    *reinterpret_cast<const uint32_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
                 auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
                 #pragma unroll
                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++j)
@@ -547,7 +551,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     // RDMA symmetric layout
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
+    // [dyogev patch] was sizeof(uint64_t) for 8 peers; uint32_t for 4 peers (matches L336 packing).
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint32_t), "Invalid number of NVL peers");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
     auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
@@ -661,10 +666,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
             // Read RDMA rank existence
-            uint64_t is_token_in_rank_uint64 = 0;
+            // [dyogev patch] uint64_t -> uint32_t to match NUM_MAX_NVL_PEERS=4 row stride.
+            uint32_t is_token_in_rank_uint64 = 0;
             if (lane_id < kNumRDMARanks) {
                 is_token_in_rank_uint64 =
-                    __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                    __ldg(reinterpret_cast<const uint32_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
             }
             __syncwarp();

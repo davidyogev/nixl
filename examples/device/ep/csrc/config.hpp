@@ -87,8 +87,10 @@ struct Config {
     }
 
     size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
-        // Legacy mode
-        if (num_ranks <= NUM_MAX_NVL_PEERS)
+        // [dyogev patch] Was `<=`. Allow num_ranks == NUM_MAX_NVL_PEERS so the
+        // single-island HT path still allocates its symmetric staging buffer;
+        // only the strict-intranode case (fewer ranks than peers) skips it.
+        if (num_ranks < NUM_MAX_NVL_PEERS)
             return 0;
 
         // Below are some assumptions

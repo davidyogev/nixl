@@ -104,6 +104,7 @@ steps:
       --build-arg NIXL_INSTALL_DIR=${NIXL_INSTALL_DIR} \
       --build-arg NIXL_BUILD_DIR=${NIXL_BUILD_DIR} \
       --build-arg HAS_GPU=true \
+      --build-arg BUILD_NIXL_EP=true \
       --build-arg BASE_IMAGE=${registry_host}${registry_path}/${arch}/nixl-ci-dl-gpu-base-25.10-cuda13.0-ubuntu24.04:${CI_IMAGE_TAG} \
       --tag ${PR_IMAGE} \
       -f .ci/dockerfiles/Dockerfile.gpu-test .

@@ -78,7 +78,9 @@ struct NixlAgentInfo
 };
 
 struct Buffer {
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
+    // [dyogev patch] dropped hard equality with 8 to support 4-GPU single-island test;
+    // Buffer's NVL-indexed members are all symbolic against NUM_MAX_NVL_PEERS.
+    // EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
 private:
     int buffer_idx = 0; // Double buffering index

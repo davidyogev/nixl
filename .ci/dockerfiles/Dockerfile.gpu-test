@@ -20,15 +20,23 @@ ARG PRE_INSTALLED_NIXL_ENV
 ARG PRE_INSTALLED_UCX_ENV
 ARG UCX_VERSION=v1.21.x
 ARG HAS_GPU=true
+ARG BUILD_NIXL_EP=false
 ARG WORKSPACE=/workspace/nixl
 
 
 WORKDIR ${WORKSPACE}
 COPY --chown="${_UID}":"${_GID}" . .
 
-RUN .gitlab/build.sh ${NIXL_INSTALL_DIR}
-RUN sudo apt-get clean && \
-    sudo rm -rf /var/lib/apt/lists/*
+RUN EXTRA_BUILD_ARGS=""; \
+    if [ "${BUILD_NIXL_EP}" = "true" ]; then \
+        EXTRA_BUILD_ARGS="-Dbuild_nixl_ep=true"; \
+    fi; \
+    .gitlab/build.sh ${NIXL_INSTALL_DIR} "" "${EXTRA_BUILD_ARGS}"
+RUN if command -v sudo >/dev/null 2>&1; then \
+        sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*; \
+    else \
+        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
 
