@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              const topk_idx_t* topk_idx,
              const float* topk_weights,
              int* send_rdma_head,
-             int* send_nvl_head,
+             int64_t* send_nvl_head,
              int* recv_rdma_channel_prefix_matrix,
              int* recv_gbl_channel_prefix_matrix,
              const int* rdma_channel_prefix_matrix,
@@ -1263,7 +1263,7 @@ void dispatch(void* recv_x,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               int* send_rdma_head,
-              int* send_nvl_head,
+              int64_t* send_nvl_head,
               int* recv_rdma_channel_prefix_matrix,
               int* recv_gbl_channel_prefix_matrix,
               const int* rdma_channel_prefix_matrix,
@@ -1365,7 +1365,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
                               int num_channels,
                               const int* rdma_channel_prefix_matrix,
                               const int* rdma_rank_prefix_sum,
-                              int* combined_nvl_head,
+                              int64_t* combined_nvl_head,
                               void* rdma_buffer_ptr,
                               void** buffer_ptrs,
                               int** barrier_signal_ptrs,
@@ -1451,7 +1451,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
 
         if (warp_id < num_channels) {
             constexpr int tma_batch_size = kNumTMABytesPerWarp - sizeof(uint64_t);
-            constexpr int num_bytes_per_token = sizeof(int) * NUM_MAX_NVL_PEERS;
+            constexpr int num_bytes_per_token = sizeof(int64_t) * NUM_MAX_NVL_PEERS;
             constexpr int num_tokens_per_batch = tma_batch_size / num_bytes_per_token;
             EP_STATIC_ASSERT(num_bytes_per_token % 16 == 0, "num_bytes_per_token should be divisible by 16");
 
@@ -1474,7 +1474,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
                 token_start_idx += shift, token_end_idx += shift;
 
                 // NOTES: `1 << 25` is a heuristic large number
-                int last_head = 1 << 25;
+                int64_t last_head = 1 << 25;
                 for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx; batch_end_idx -= num_tokens_per_batch) {
                     auto batch_start_idx = max(token_start_idx, batch_end_idx - num_tokens_per_batch);
 
@@ -1491,9 +1491,9 @@ __global__ void cached_notify(const int rdma_clean_offset,
                     for (int token_idx = batch_end_idx - 1; token_idx >= batch_start_idx; --token_idx) {
                         if (lane_id < NUM_MAX_NVL_PEERS) {
                             auto current_head =
-                                reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
+                                reinterpret_cast<int64_t*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
                             if (current_head < 0) {
-                                reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
+                                reinterpret_cast<int64_t*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
                                     -last_head - 1;
                             } else {
                                 last_head = current_head;
@@ -1525,7 +1525,7 @@ void cached_notify(int hidden_int4,
                    int* combined_rdma_head,
                    const int* rdma_channel_prefix_matrix,
                    const int* rdma_rank_prefix_sum,
-                   int* combined_nvl_head,
+                   int64_t* combined_nvl_head,
                    void* rdma_buffer_ptr,
                    int num_max_rdma_chunked_recv_tokens,
                    void** buffer_ptrs,
@@ -1772,7 +1772,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                                         const int4* bias_0,
                                                                         const int4* bias_1,
                                                                         const int* combined_rdma_head,
-                                                                        const int* combined_nvl_head,
+                                                                        const int64_t* combined_nvl_head,
                                                                         const SourceMeta* src_meta,
                                                                         const int* rdma_channel_prefix_matrix,
                                                                         const int* rdma_rank_prefix_sum,
@@ -2094,7 +2094,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
                     int expected_head = -1;
                     if (lane_id < NUM_MAX_NVL_PEERS) {
-                        expected_head = ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+                        expected_head = static_cast<int>(ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id));
                         expected_head < 0 ? (forwarder_nvl_head[warp_id][lane_id] = -expected_head - 1)
                                           : (forwarder_nvl_head[warp_id][lane_id] = expected_head);
                     }
@@ -2344,7 +2344,7 @@ void combine(cudaDataType_t type,
              const void* bias_0,
              const void* bias_1,
              const int* combined_rdma_head,
-             const int* combined_nvl_head,
+             const int64_t* combined_nvl_head,
              const void* src_meta,
              const int* rdma_channel_prefix_matrix,
              const int* rdma_rank_prefix_sum,
