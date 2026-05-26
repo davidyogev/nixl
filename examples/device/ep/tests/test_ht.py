@@ -65,7 +65,9 @@ def test_main(
         args.num_experts,
     )
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 4
+    # [dyogev patch] was hard-coded num_local_ranks == 4 (single-island branch);
+    # 2x2 sanity run uses num_local_ranks == 2, 2 RDMA islands on one physical host.
+    assert num_experts % num_ranks == 0 and num_local_ranks in (2, 4)
     if local_rank == 0:
         print(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
@@ -162,9 +164,7 @@ def test_main(
 
     # Config
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
-    # [dyogev patch] rdma_chunked_send_tokens bumped 16 -> 24 to satisfy
-    # nixl_ep_ht.cu:2424 (>= num_warps_per_forwarder == kNumCombineForwarderWarps/num_rdma_ranks == 24/1).
-    config = nixl_ep.Config(num_sms, 8, nvl_buffer_size, 24, rdma_buffer_size)
+    config = nixl_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -414,9 +414,7 @@ def test_main(
     # Tune combine performance
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 8, 1):
-        # [dyogev patch] single-node lower bound 8 -> 24: combine asserts num_max_rdma_chunked_send_tokens >= 24
-        # when num_rdma_ranks == 1 (kNumCombineForwarderWarps/1).
-        for rdma_chunk_size in range(12 if num_nodes == 2 else 24, 33, 4):
+        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
             config = nixl_ep.Config(
                 num_sms,
                 nvl_chunk_size,
@@ -497,7 +495,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     buffer.connect_ranks([i for i in range(num_ranks) if i != rank])
 
-    assert num_local_ranks == 4 and num_ranks == num_local_ranks
+    # [dyogev patch] accept both the 4-GPU single-island (4,4) and the 2x2 single-host (2,4) layouts.
+    assert num_local_ranks in (2, 4) and num_ranks == 4 and num_ranks % num_local_ranks == 0
     torch.manual_seed(rank)
 
     for i in (num_sms,):
@@ -535,6 +534,16 @@ if __name__ == "__main__":
         type=int,
         default=8,
         help="Number of processes to spawn (default: 8)",
+    )
+    # [dyogev patch] decoupled from --num-processes so a single host can pretend to be
+    # multiple logical nodes (e.g. --num-processes 4 --num-local-ranks 2 + WORLD_SIZE=2
+    # gives a 2x2 layout where the kernel routes 0<->1 and 2<->3 over NVLink and the
+    # 0<->2/0<->3/1<->2/1<->3 pairs through the RDMA codepath).
+    parser.add_argument(
+        "--num-local-ranks",
+        type=int,
+        default=None,
+        help="NIXL num_local_ranks (default: same as --num-processes)",
     )
     parser.add_argument(
         "--num-tokens", type=int, default=4096, help="Number of tokens (default: 4096)"
@@ -578,8 +587,11 @@ if __name__ == "__main__":
         args.num_topk_groups = min(num_nodes, 4)
 
     num_processes = args.num_processes
+    # [dyogev patch] num_local_ranks defaults to num_processes (preserves the legacy invariant
+    # nprocs == num_local_ranks); the 2x2 single-host run overrides it.
+    num_local_ranks = args.num_local_ranks if args.num_local_ranks is not None else num_processes
     # 2-node run (WORLD_SIZE=2): run on both nodes with same MASTER_ADDR/MASTER_PORT; node1 needs --tcp-server <node0_ip>.
     # NVL/RDMA timeouts across nodes usually mean RDMA/IB/UCX between nodes is broken or slow (e.g. "accelerated IB support was not found" on one node).
     torch.multiprocessing.spawn(
-        test_loop, args=(num_processes, args), nprocs=num_processes
+        test_loop, args=(num_local_ranks, args), nprocs=num_processes
     )

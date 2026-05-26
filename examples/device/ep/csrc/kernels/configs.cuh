@@ -22,8 +22,10 @@
 
 #pragma once
 
-// [dyogev patch] reduced from 8 for single-island 4-GPU testing (matches CI topology).
-#define NUM_MAX_NVL_PEERS 4
+// [dyogev patch] reduced from 8 for 2x2 single-host testing (2 NVL peers per
+// island, 2 RDMA islands, 4 GPUs total). Pair within an island shares NVLink;
+// pairs across islands traverse the kernel's RDMA codepath through nixlPut.
+#define NUM_MAX_NVL_PEERS 2
 #define NUM_MAX_RDMA_PEERS 20
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
