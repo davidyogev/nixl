@@ -204,6 +204,13 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < kNumRDMARanks)
             rdma_recv_num_tokens_mixed.send_buffer(thread_id)[NUM_MAX_NVL_PEERS + num_rdma_experts] = num_tokens_per_rdma_rank[thread_id];
         __syncthreads();
+        // [dyogev patch] System-scope fence before posting the put. __syncthreads()
+        // above only synchronizes thread execution within the block; it does NOT
+        // drain L2 dirty lines to HBM. Without this fence, the HCA's GDR-read of
+        // send_buffer can race the L2->HBM writeback and return stale bytes. This
+        // is latent on multi-node fabrics (wire latency hides the race) but
+        // exposed on intra-node RDMA loopback in the 2x2 single-host CI config.
+        __threadfence_system();
 
         // Issue send
         // TODO: more light fence or barrier or signaling
@@ -239,6 +246,13 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 nixl_barrier_wait(nixl_ctx, num_channels);
         }
         __syncthreads();
+        // [dyogev patch] System-scope fence after the barrier wait. The barrier
+        // tells us all peers finished posting; the HCA has landed all incoming
+        // RDMA writes in HBM via BAR1. But L2 on this GPU may still hold cached
+        // pre-RDMA contents of recv_buffer, and the reductions below read with
+        // plain ld.global. This fence forces the local view to acquire the
+        // freshly-written HBM contents.
+        __threadfence_system();
 
         // NVL buffers
         auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
