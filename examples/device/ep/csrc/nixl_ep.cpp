@@ -551,7 +551,13 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
     auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
     auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kCUDA));
-    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kCUDA));
+    // [dyogev patch] Allocate with padded island stride so the HT kernel's
+    // uint64-packed reads of is_token_in_rank are naturally aligned. Padding
+    // bytes (beyond NUM_MAX_NVL_PEERS within each island slice) must be zero
+    // because the kernel's `total_count += (is_token_in_rank_uint64 != 0)`
+    // check spans the full uint64 word -- hence torch::zeros, not torch::empty.
+    auto is_token_in_rank = torch::zeros({num_tokens, num_rdma_ranks * IS_TOKEN_IN_RANK_ISLAND_STRIDE},
+                                         dtype(torch::kBool).device(torch::kCUDA));
     if (is_ht_available())
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -896,7 +902,7 @@ Buffer::ht_combine(const torch::Tensor& x, const std::optional<torch::Tensor>& t
     auto num_combined_tokens = static_cast<int>(is_combined_token_in_rank.size(0));
     EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
     EP_HOST_ASSERT(src_meta.size(1) == ht::get_source_meta_bytes());
-    EP_HOST_ASSERT(is_combined_token_in_rank.size(1) == num_ranks);
+    EP_HOST_ASSERT(is_combined_token_in_rank.size(1) == num_rdma_ranks * IS_TOKEN_IN_RANK_ISLAND_STRIDE);
     EP_HOST_ASSERT(rdma_channel_prefix_matrix.size(0) == num_rdma_ranks and rdma_channel_prefix_matrix.size(1) == num_channels);
     EP_HOST_ASSERT(rdma_rank_prefix_sum.size(0) == num_rdma_ranks);
     EP_HOST_ASSERT(gbl_channel_prefix_matrix.size(0) == num_ranks and gbl_channel_prefix_matrix.size(1) == num_channels);

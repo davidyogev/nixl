@@ -104,10 +104,20 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
                 }
             }
 
-            auto shifted_is_token_in_rank = is_token_in_rank + i * num_ranks;
+            // [dyogev patch] Row layout is padded to `num_rdma_ranks * IS_TOKEN_IN_RANK_ISLAND_STRIDE`
+            // bytes; within each row, position of rank `r` is
+            // `(r / NUM_MAX_NVL_PEERS) * IS_TOKEN_IN_RANK_ISLAND_STRIDE + (r % NUM_MAX_NVL_PEERS)`.
+            // The buffer is zero-initialized by the host allocator, so the
+            // `IS_TOKEN_IN_RANK_ISLAND_STRIDE - NUM_MAX_NVL_PEERS` padding bytes
+            // per island remain zero.
+            const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+            auto shifted_is_token_in_rank = is_token_in_rank + i * num_rdma_ranks * IS_TOKEN_IN_RANK_ISLAND_STRIDE;
             #pragma unroll
             for (int j = 0; j + rank_begin_idx < rank_end_idx; ++ j) {
-                shifted_is_token_in_rank[j + rank_begin_idx] = (is_in_rank[j] > 0);
+                const int rank_idx = j + rank_begin_idx;
+                const int rdma_idx = rank_idx / NUM_MAX_NVL_PEERS;
+                const int nvl_idx = rank_idx % NUM_MAX_NVL_PEERS;
+                shifted_is_token_in_rank[rdma_idx * IS_TOKEN_IN_RANK_ISLAND_STRIDE + nvl_idx] = (is_in_rank[j] > 0);
                 num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0);
             }
 

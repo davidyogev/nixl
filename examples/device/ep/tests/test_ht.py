@@ -137,7 +137,23 @@ def test_main(
     for i in range(num_nodes):
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = token_idx_in_rank >= 0
+    is_token_in_rank_semantic = token_idx_in_rank >= 0
+    # [dyogev patch] Pad the matrix to the kernel's padded row layout:
+    # `[num_tokens, num_rdma_ranks * IS_TOKEN_IN_RANK_ISLAND_STRIDE]` (= 8 bytes
+    # per island when num_local_ranks < 8) so the HT kernel can issue naturally-
+    # aligned uint64 loads. Bytes beyond num_local_ranks within each island slice
+    # are zero. Must mirror configs.cuh:IS_TOKEN_IN_RANK_ISLAND_STRIDE.
+    IS_TOKEN_IN_RANK_ISLAND_STRIDE = 8 if num_local_ranks < 8 else num_local_ranks
+    is_token_in_rank = torch.zeros(
+        num_tokens, num_nodes, IS_TOKEN_IN_RANK_ISLAND_STRIDE,
+        dtype=torch.bool, device="cuda",
+    )
+    is_token_in_rank[..., :num_local_ranks] = is_token_in_rank_semantic.view(
+        num_tokens, num_nodes, num_local_ranks
+    )
+    is_token_in_rank = is_token_in_rank.view(
+        num_tokens, num_nodes * IS_TOKEN_IN_RANK_ISLAND_STRIDE
+    ).contiguous()
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 

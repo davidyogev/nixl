@@ -27,6 +27,15 @@
 // pairs across islands traverse the kernel's RDMA codepath through nixlPut.
 #define NUM_MAX_NVL_PEERS 2
 #define NUM_MAX_RDMA_PEERS 20
+
+// [dyogev patch] Byte stride per NVL-island slice in the `is_token_in_rank`
+// matrix. The HT dispatch kernel reads each island slice as a uint64_t for
+// efficiency (single packed load, fast nonzero test, broadcastable across
+// lanes via `broadcast<uint64_t>` which requires sizeof(T) % sizeof(int) == 0).
+// Pad to 8 bytes when NUM_MAX_NVL_PEERS < 8 so the reinterpret_cast<uint64_t>
+// is naturally aligned and `broadcast<uint64_t>` instantiates cleanly.
+// Collapses to NUM_MAX_NVL_PEERS in production (>= 8).
+#define IS_TOKEN_IN_RANK_ISLAND_STRIDE ((NUM_MAX_NVL_PEERS) < 8 ? 8 : (NUM_MAX_NVL_PEERS))
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
 #define NUM_BUFFER_ALIGNMENT_BYTES 128

@@ -334,11 +334,17 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                // [dyogev patch] island slice is NUM_MAX_NVL_PEERS bytes; load width tracks it
-                // (uint64_t for 8 peers, uint32_t for 4, uint16_t for 2).
-                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint16_t), "Invalid number of NVL peers");
+                // [dyogev patch] Read each island slice as uint64_t. With matrix padding
+                // (IS_TOKEN_IN_RANK_ISLAND_STRIDE = 8 bytes per island when
+                // NUM_MAX_NVL_PEERS < 8), the load is naturally 8-byte aligned. The
+                // first NUM_MAX_NVL_PEERS bytes are real bools; remaining bytes are
+                // zero padding (allocator uses torch::zeros).
+                EP_STATIC_ASSERT(IS_TOKEN_IN_RANK_ISLAND_STRIDE == sizeof(uint64_t),
+                                 "Island stride must be 8 bytes for uint64-packed load");
                 auto is_token_in_rank_uint64 =
-                    *reinterpret_cast<const uint16_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
+                    *reinterpret_cast<const uint64_t*>(is_token_in_rank
+                                                       + i * kNumRDMARanks * IS_TOKEN_IN_RANK_ISLAND_STRIDE
+                                                       + dst_rdma_rank * IS_TOKEN_IN_RANK_ISLAND_STRIDE);
                 auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
                 #pragma unroll
                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++j)
@@ -552,8 +558,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     EP_DEVICE_ASSERT(num_topk <= 32);
 
     // RDMA symmetric layout
-    // [dyogev patch] mirrors the load width selected in notify_dispatch (uint16_t for 2 peers).
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint16_t), "Invalid number of NVL peers");
+    // [dyogev patch] mirrors the uint64-packed island-slice load used below
+    // (matrix row is padded to `IS_TOKEN_IN_RANK_ISLAND_STRIDE = 8` bytes per island).
+    EP_STATIC_ASSERT(IS_TOKEN_IN_RANK_ISLAND_STRIDE == sizeof(uint64_t),
+                     "Island stride must be 8 bytes for uint64-packed load");
     auto hidden_bytes = hidden_int4 * sizeof(int4);
     auto scale_bytes = num_scales * sizeof(float);
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
@@ -667,11 +675,14 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
             // Read RDMA rank existence
-            // [dyogev patch] uint16_t to match NUM_MAX_NVL_PEERS=2 island stride (2 bytes).
-            uint16_t is_token_in_rank_uint64 = 0;
+            // [dyogev patch] uint64_t load against the padded matrix layout
+            // (IS_TOKEN_IN_RANK_ISLAND_STRIDE = 8). Padding bytes are zero.
+            uint64_t is_token_in_rank_uint64 = 0;
             if (lane_id < kNumRDMARanks) {
                 is_token_in_rank_uint64 =
-                    __ldg(reinterpret_cast<const uint16_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                    __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank
+                                                            + token_idx * kNumRDMARanks * IS_TOKEN_IN_RANK_ISLAND_STRIDE
+                                                            + lane_id * IS_TOKEN_IN_RANK_ISLAND_STRIDE));
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
             }
             __syncwarp();
