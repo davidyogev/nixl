@@ -247,15 +247,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         }
         __syncthreads();
         // [dyogev patch] System-scope fence after the barrier wait. The barrier
-        // wait has observed all peers' puts as complete; the HCA has landed all
-        // incoming RDMA writes in HBM via BAR1. The fence orders this thread's
-        // prior accesses w.r.t. subsequent ones at system scope, which together
-        // with the volatile loads in the reductions below (ld.volatile.global
-        // bypasses L2 -> reads from HBM directly) makes the HCA-deposited data
-        // observable to this kernel. Without the volatile loads, a plain
-        // ld.global can hit a stale L2 line that pre-dates the foreign PCIe
-        // write, and Hopper's L2 is not guaranteed to invalidate such lines on
-        // incoming BAR1 writes.
+        // tells us all peers finished posting; the HCA has landed all incoming
+        // RDMA writes in HBM via BAR1. But L2 on this GPU may still hold cached
+        // pre-RDMA contents of recv_buffer, and the reductions below read with
+        // plain ld.global. This fence forces the local view to acquire the
+        // freshly-written HBM contents.
         __threadfence_system();
 
         // NVL buffers
@@ -283,14 +279,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++i)
-                // [dyogev patch] Volatile load on recv_buffer. The cross-island
-                // entries (i != rdma_rank) were written by the HCA's GDR PCIe
-                // writes to BAR1->HBM; this GPU's L2 may still hold pre-RDMA
-                // cached lines for those addresses. A plain ld.global can hit
-                // the stale L2 line. ld.volatile.global bypasses L2 and reads
-                // from HBM, which by the time we get here is correct (the
-                // RDMA barrier_wait above has observed all peers' puts complete).
-                sum += ld_volatile_global(&rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id]);
+                sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id];
             nvl_reduced_num_tokens_per_expert[thread_id] = sum;
         }
         __syncthreads();
@@ -312,11 +301,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < NUM_MAX_NVL_PEERS) {
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++i)
-                // [dyogev patch] Same volatile-load reasoning as the per-expert
-                // reduction above: recv_buffer(i != rdma_rank) was written by
-                // the HCA into HBM via BAR1, but local L2 may hold a stale
-                // pre-RDMA line. Bypass L2.
-                nvl_send_num_tokens_per_rank.buffer(nvl_rank)[i] = ld_volatile_global(&rdma_recv_num_tokens_mixed.recv_buffer(i)[thread_id]);
+                nvl_send_num_tokens_per_rank.buffer(nvl_rank)[i] = rdma_recv_num_tokens_mixed.recv_buffer(i)[thread_id];
             #pragma unroll
             for (int i = 0; i < num_nvl_experts; ++i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
