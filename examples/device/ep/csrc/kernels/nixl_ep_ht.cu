@@ -279,7 +279,21 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++i)
-                sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id];
+                // [dyogev patch] System-scope acquire load on recv_buffer.
+                // The cross-island entries (i != rdma_rank) were written by the
+                // HCA's GDR PCIe writes to BAR1 -> HBM. This GPU's L2 may still
+                // hold pre-RDMA cached lines for those addresses; on Hopper,
+                // incoming BAR1 writes do not unconditionally invalidate L2.
+                // ld.acquire.sys gives this thread a system-scope acquire,
+                // forcing the load to observe any system-visible store that
+                // happened-before this point - including the HCA's write that
+                // was made happen-before by the barrier_wait above.
+                // For the self entry (i == rdma_rank), the data was written by
+                // this same SM via UNROLLED_WARP_COPY/st_na_global and made
+                // globally visible by the __threadfence_system() at the start
+                // of this section, so the acquire load reads the correct value
+                // via either L2 (still fresh) or HBM (drained).
+                sum += ld_acquire_sys_global(&rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id]);
             nvl_reduced_num_tokens_per_expert[thread_id] = sum;
         }
         __syncthreads();
@@ -289,7 +303,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++i) {
-                sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + num_rdma_experts];
+                // [dyogev patch] Same acquire-load reasoning as above.
+                sum += ld_acquire_sys_global(&rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + num_rdma_experts]);
                 recv_rdma_rank_prefix_sum[i] = sum;
             }
             while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1);
@@ -301,7 +316,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < NUM_MAX_NVL_PEERS) {
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++i)
-                nvl_send_num_tokens_per_rank.buffer(nvl_rank)[i] = rdma_recv_num_tokens_mixed.recv_buffer(i)[thread_id];
+                // [dyogev patch] Same acquire-load reasoning as above.
+                nvl_send_num_tokens_per_rank.buffer(nvl_rank)[i] = ld_acquire_sys_global(&rdma_recv_num_tokens_mixed.recv_buffer(i)[thread_id]);
             #pragma unroll
             for (int i = 0; i < num_nvl_experts; ++i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
