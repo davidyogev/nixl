@@ -244,10 +244,21 @@ def test_main(
                     assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
                         0
                     ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
-                    assert (
-                        gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
-                        == recv_num_tokens_per_expert_list
-                    )
+                    _expected_expert_list = gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
+                    if _expected_expert_list != recv_num_tokens_per_expert_list:
+                        _diff_idx = [
+                            i for i in range(len(_expected_expert_list))
+                            if _expected_expert_list[i] != recv_num_tokens_per_expert_list[i]
+                        ]
+                        print(
+                            f"[diag rank={rank}] dispatch expert-count mismatch: "
+                            f"expected_sum={sum(_expected_expert_list)} got_sum={sum(recv_num_tokens_per_expert_list)} "
+                            f"num_mismatch={len(_diff_idx)} first_mismatch_idx={_diff_idx[:8]}\n"
+                            f"  expected[first8]={_expected_expert_list[:8]}\n"
+                            f"  got[first8]     ={recv_num_tokens_per_expert_list[:8]}",
+                            flush=True,
+                        )
+                    assert _expected_expert_list == recv_num_tokens_per_expert_list
                     if current_x is not x_pure_rand:
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
