@@ -241,9 +241,35 @@ def test_main(
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    _expected_recv = gbl_num_tokens_per_rank[rank].item()
+                    _actual_recv = recv_x.size(0)
+                    _per_rank_actual_recv = torch.tensor(
+                        [_actual_recv], dtype=torch.long, device="cuda"
+                    )
+                    _per_rank_gather = [
+                        torch.zeros(1, dtype=torch.long, device="cuda")
+                        for _ in range(num_ranks)
+                    ]
+                    dist.all_gather(_per_rank_gather, _per_rank_actual_recv, group=group)
+                    _all_actual = [t.item() for t in _per_rank_gather]
+                    _all_expected = gbl_num_tokens_per_rank.tolist()
+                    if rank == 0:
+                        print(
+                            f"[diag] per-rank token receive (rank: expected -> actual, diff)\n"
+                            + "\n".join(
+                                f"  rank {r}: {_all_expected[r]:>6} -> {_all_actual[r]:>6}  "
+                                f"diff={_all_actual[r]-_all_expected[r]:+}  "
+                                f"({(_all_actual[r]/_all_expected[r]*100):.1f}%)"
+                                if _all_expected[r] else
+                                f"  rank {r}: {_all_expected[r]:>6} -> {_all_actual[r]:>6}  diff={_all_actual[r]-_all_expected[r]:+}"
+                                for r in range(num_ranks)
+                            ),
+                            flush=True,
+                        )
+                    dist.barrier(group=group)
+                    assert _expected_recv == _actual_recv, (
+                        f"rank {rank}: expected {_expected_recv}, got {_actual_recv}"
+                    )
                     _expected_expert_list = gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                     if _expected_expert_list != recv_num_tokens_per_expert_list:
                         _diff_idx = [
