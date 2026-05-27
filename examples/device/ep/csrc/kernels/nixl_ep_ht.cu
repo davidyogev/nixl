@@ -297,6 +297,23 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             }
         }
 
+        // [dyogev RACE_TEST] Cheap experiment: spin ~280us (500K cycles at
+        // ~1.75GHz) in EVERY thread to drain any in-flight cuda_ipc / RDMA DMA
+        // before the L296 reduction. The race hypothesis is that
+        // nixl_barrier_wait above returns when the BARRIER signal arrives, not
+        // when the payload puts have fully landed in HBM. If this spin makes
+        // Stage C show the correct sums (recv(0)+recv(1)) for the bad slots,
+        // the bug is a sender-side put-completion race and the structural fix
+        // is a flush on the sender (or a per-peer arrival sentinel on the
+        // receiver) before posting the barrier. ALL threads participate so no
+        // warp can race ahead while a sibling warp is still printf-stalled in
+        // Stage B; the __syncthreads is the final pre-reduction rendezvous.
+        {
+            long long start = clock64();
+            while (clock64() - start < 500000) { /* spin */ }
+        }
+        __syncthreads();
+
         // NVL buffers
         auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
         auto nvl_recv_buffer = buffer_ptrs[nvl_rank];
