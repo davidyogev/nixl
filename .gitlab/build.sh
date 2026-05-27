@@ -369,6 +369,7 @@ else
 fi # PRE_INSTALLED_UCX_ENV end
 
 $SUDO rm -rf ${TMPDIR}
+unset TMPDIR
 
 # Disabling CUDA IPC not to use NVLINK, as it slows down local
 # UCX transfers and can cause contention with local collectives.

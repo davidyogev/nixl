@@ -559,7 +559,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # [dyogev patch] accept both the 4-GPU single-island (4,4) and the 2x2 single-host (2,4) layouts.
     assert num_local_ranks in (2, 4) and num_ranks == 4 and num_ranks % num_local_ranks == 0
-    torch.manual_seed(rank)
+    torch.manual_seed(rank + int(os.getenv("EP_SEED_OFFSET", "0")))
 
     for i in (num_sms,):
         test_main(
