@@ -332,20 +332,18 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             #pragma unroll
             for (int i = 0; i < num_nvl_experts; ++i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
-            // [dyogev fix] System-scope fence to flush the cross-peer cuda_ipc
-            // writes above before the barrier_block. Writes via the cuda_ipc-
-            // mapped peer pointer can sit in this SM's L2 and propagate to
-            // peer HBM over NVLink asynchronously; barrier_block only
-            // synchronizes thread-level execution via the signal array, it
-            // does NOT drain in-flight peer-HBM writes. Previously masked by
-            // the 280us debug spin in notify_dispatch; with the spin removed
-            // (replaced by per-put nixlGpuGetXferStatus wait), the trailing
-            // entries of the 64-int per-expert table were not yet visible to
-            // the NVL peer when it read at L354 -> systematic loss of the
-            // "last N writes from peer 1" on rank 0 and "first N writes from
-            // peer 0" on rank 1.
-            __threadfence_system();
         }
+        // [dyogev fix] System-scope fence outside the divergent if-block so
+        // ALL threads in the block participate. The cuda_ipc writes above are
+        // issued by threads 0..NUM_MAX_NVL_PEERS-1; the writer-only fence
+        // (inside the if-block) drains those threads' stores but is executed
+        // by a divergent warp - threads 0,1 hit the fence while threads 2..31
+        // of the same warp are skipping it. Empirically, the writer-only
+        // fence + plain reader load deterministically lost trailing writes
+        // of the 64-int per-expert table in the 2x2 single-host config.
+        // Moving the fence after __syncthreads / barrier_block boundary
+        // (well, before barrier_block here) ensures uniform participation.
+        __threadfence_system();
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank, timeout_cycles);
 
         // Reduce the number of tokens per rank/expert
@@ -365,7 +363,15 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
-                sum += nvl_recv_num_tokens_per_expert.buffer(i)[thread_id];
+                // [dyogev fix] System-scope acquire load. The peer's writes
+                // to this buffer arrive via cuda_ipc / NVLink and may not be
+                // visible to this GPU's L2 with a plain load even after the
+                // peer's writer-side __threadfence_system + barrier_block.
+                // The plain read was deterministically returning the
+                // pre-write (cleanup-zeroed) cacheline contents for the
+                // trailing writes of the 64-int per-expert exchange in the
+                // 2x2 single-host config.
+                sum += ld_acquire_sys_global(&nvl_recv_num_tokens_per_expert.buffer(i)[thread_id]);
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1);
             moe_recv_expert_counter_mapped[thread_id] = sum;
