@@ -916,9 +916,21 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     int translated_dst = translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank);
                     nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, src_offset};
                     nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t)translated_dst, dst_offset};
-                    EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
-                                         src_mdesc, dst_mdesc, num_bytes_per_msg, channel_id) ==
-                                     NIXL_IN_PROG);
+                    // [dyogev fix] Wait for the payload put to complete before
+                    // posting the tail atomic-add below. Without this wait the
+                    // atomic-add can land at the receiver before the payload
+                    // does; the forwarder then reads stale RDMA buffer bytes,
+                    // src_meta.is_token_in_nvl_rank() returns false for the
+                    // ghost tokens, no NVL writes happen, nvl_channel_tail is
+                    // never advanced, and the NVL receiver times out.
+                    nixlGpuXferStatusH xfer_status;
+                    nixl_status_t put_status = nixlPut<nixl_gpu_level_t::WARP>(
+                        src_mdesc, dst_mdesc, num_bytes_per_msg, channel_id, 0, &xfer_status);
+                    EP_DEVICE_ASSERT(put_status == NIXL_IN_PROG);
+                    do {
+                        put_status = nixlGpuGetXferStatus<nixl_gpu_level_t::WARP>(xfer_status);
+                    } while (put_status == NIXL_IN_PROG);
+                    EP_DEVICE_ASSERT(put_status == NIXL_SUCCESS);
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -2224,9 +2236,18 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                         int translated_dst_comb = translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank);
                         nixlMemViewElem src_mdesc_comb{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
                         nixlMemViewElem dst_mdesc_comb{nixl_ctx.remote_mvh, (size_t)translated_dst_comb, nixl_ctx.offset_get(dst_ptr)};
-                        EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
-                                             src_mdesc_comb, dst_mdesc_comb, num_bytes_per_msg, channel_id) ==
-                                         NIXL_IN_PROG);
+                        // [dyogev fix] Same put-completion wait as dispatch's
+                        // RDMA sender at L919. Without this, the rdma_channel_tail
+                        // atomic-add below can land before the payload, causing
+                        // the combine RDMAReceiver to read stale bytes.
+                        nixlGpuXferStatusH xfer_status_comb;
+                        nixl_status_t put_status_comb = nixlPut<nixl_gpu_level_t::WARP>(
+                            src_mdesc_comb, dst_mdesc_comb, num_bytes_per_msg, channel_id, 0, &xfer_status_comb);
+                        EP_DEVICE_ASSERT(put_status_comb == NIXL_IN_PROG);
+                        do {
+                            put_status_comb = nixlGpuGetXferStatus<nixl_gpu_level_t::WARP>(xfer_status_comb);
+                        } while (put_status_comb == NIXL_IN_PROG);
+                        EP_DEVICE_ASSERT(put_status_comb == NIXL_SUCCESS);
                     } else {
                         memory_fence();
                     }
