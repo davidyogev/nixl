@@ -212,24 +212,15 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // exposed on intra-node RDMA loopback in the 2x2 single-host CI config.
         __threadfence_system();
 
-        // [dyogev CHUNK_PROBE] Stage A: snapshot of send_buffer(1) for the
-        // bad-chunk slot range, AFTER the system fence. If the values are
-        // already wrong here, the bug is on the writer side (scatter/fence).
-        if (thread_id == 0) {
-            const int probe_s[] = {0, 55, 56, 88, 119, 120, 127};
-            #pragma unroll
-            for (int k = 0; k < 7; ++k) {
-                int s = probe_s[k];
-                int sb1 = rdma_recv_num_tokens_mixed.send_buffer(1)[NUM_MAX_NVL_PEERS + s];
-                int gt  = num_tokens_per_expert[1 * num_rdma_experts + s];
-                printf("[CHUNK A rank=%d] send_buffer(1)[NMNP+%d]=%d gt=%d %s\n",
-                       rank, s, sb1, gt, (sb1 == gt) ? "OK" : "BAD-WRITE");
-            }
-        }
-
         // Issue send
-        // TODO: more light fence or barrier or signaling
-        // TODO: overlap EP barrier and NVL cleaning
+        // [dyogev fix] Each cross-island put is paired with a completion wait
+        // via nixlGpuXferStatusH / nixlGpuGetXferStatus. Without this,
+        // nixlPut returns NIXL_IN_PROG with the data DMA still in flight,
+        // and the nixl_barrier_send_warp below can signal "done" before
+        // payload bytes have landed in the receiver's HBM. That race caused
+        // the receiver's reductions at L296/L334/L353 to read stale (zero)
+        // bytes for cross-island slots in the 2x2 single-host config. The
+        // wait makes barrier_send strictly happen-after payload arrival.
         for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
             if (i != rdma_rank) {
                 size_t src_offset = nixl_ctx.offset_get(reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)));
@@ -238,9 +229,14 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 int translated_dst = translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank);
                 nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, src_offset};
                 nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t)translated_dst, dst_offset};
+                nixlGpuXferStatusH xfer_status;
                 nixl_status_t status = nixlPut<nixl_gpu_level_t::WARP>(
-                    src_mdesc, dst_mdesc, msg_size, 0);
+                    src_mdesc, dst_mdesc, msg_size, 0, 0, &xfer_status);
                 EP_DEVICE_ASSERT(status == NIXL_IN_PROG);
+                do {
+                    status = nixlGpuGetXferStatus<nixl_gpu_level_t::WARP>(xfer_status);
+                } while (status == NIXL_IN_PROG);
+                EP_DEVICE_ASSERT(status == NIXL_SUCCESS);
             } else {
                 UNROLLED_WARP_COPY(1,
                                    lane_id,
@@ -268,51 +264,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // plain ld.global. This fence forces the local view to acquire the
         // freshly-written HBM contents.
         __threadfence_system();
-
-        // [dyogev CHUNK_PROBE] Stage B: snapshot of recv_buffer(0..1) for the
-        // bad-chunk slot range, AFTER the post-barrier system fence. We read
-        // each slot three ways:
-        //   plain  : ordinary global load (may sit in L1).
-        //   acq    : ld.acquire.sys.global (system-scope acquire).
-        //   cv     : __ldcv  (cache-volatile, forces L2 re-fetch).
-        // If plain != acq or plain != cv, we have a coherency hazard at this
-        // read site. If all three agree but disagree with the sender's value,
-        // the wrong bytes are physically in HBM (transport corruption).
-        if (thread_id == 0) {
-            const int probe_s[] = {0, 55, 56, 88, 119, 120, 127};
-            #pragma unroll
-            for (int k = 0; k < 7; ++k) {
-                int s = probe_s[k];
-                #pragma unroll
-                for (int i = 0; i < kNumRDMARanks; ++i) {
-                    int* p = &rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + s];
-                    int plain = *p;
-                    int acq   = ld_acquire_sys_global(p);
-                    int cv    = __ldcv(p);
-                    bool mismatch = (plain != acq) || (acq != cv);
-                    printf("[CHUNK B rank=%d src=%d s=%d] plain=%d acq=%d cv=%d %s\n",
-                           rank, i, s, plain, acq, cv,
-                           mismatch ? "STALE" : "");
-                }
-            }
-        }
-
-        // [dyogev RACE_TEST] Cheap experiment: spin ~280us (500K cycles at
-        // ~1.75GHz) in EVERY thread to drain any in-flight cuda_ipc / RDMA DMA
-        // before the L296 reduction. The race hypothesis is that
-        // nixl_barrier_wait above returns when the BARRIER signal arrives, not
-        // when the payload puts have fully landed in HBM. If this spin makes
-        // Stage C show the correct sums (recv(0)+recv(1)) for the bad slots,
-        // the bug is a sender-side put-completion race and the structural fix
-        // is a flush on the sender (or a per-peer arrival sentinel on the
-        // receiver) before posting the barrier. ALL threads participate so no
-        // warp can race ahead while a sibling warp is still printf-stalled in
-        // Stage B; the __syncthreads is the final pre-reduction rendezvous.
-        {
-            long long start = clock64();
-            while (clock64() - start < 500000) { /* spin */ }
-        }
-        __syncthreads();
 
         // NVL buffers
         auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
@@ -358,21 +309,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         }
         __syncthreads();
 
-        // [dyogev CHUNK_PROBE] Stage C: snapshot of nvl_reduced_num_tokens_per_expert
-        // after the per-RDMA-source reduction. Indexed by island slot s; covers
-        // BOTH halves [0..63] and [64..127] since both halves feed the NVL
-        // exchange below.
-        if (thread_id == 0) {
-            const int probe_s[] = {0, 55, 56, 88, 119, 120, 127};
-            #pragma unroll
-            for (int k = 0; k < 7; ++k) {
-                int s = probe_s[k];
-                printf("[CHUNK C rank=%d s=%d] nvl_reduced=%d\n",
-                       rank, s, nvl_reduced_num_tokens_per_expert[s]);
-            }
-        }
-        __syncthreads();
-
         // Reduce RDMA received tokens
         if (thread_id == 0) {
             int sum = 0;
@@ -399,34 +335,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         }
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank, timeout_cycles);
 
-        // [dyogev CHUNK_PROBE] Stage D: snapshot of nvl_recv_num_tokens_per_expert
-        // for the bad-chunk range, AFTER the NVL peer barrier. These buffers
-        // live in cuda_ipc-mapped memory; peer GPUs wrote them at L322-323.
-        // Same three-way load (plain / acq / cv) to detect L2 staleness on
-        // the cuda_ipc read path - we have NO fence/acquire here in production.
-        // Slots probed cover the per-rank list:
-        //   rank 2 (nvl=0): slots 0..63 -> covers global experts 128..191.
-        //   rank 3 (nvl=1): slots 0..63 -> covers global experts 192..255.
-        if (thread_id == 0) {
-            const int probe_s[] = {0, 24, 55, 56, 63};
-            #pragma unroll
-            for (int k = 0; k < 5; ++k) {
-                int s = probe_s[k];
-                #pragma unroll
-                for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i) {
-                    int* p = &nvl_recv_num_tokens_per_expert.buffer(i)[s];
-                    int plain = *p;
-                    int acq   = ld_acquire_sys_global(p);
-                    int cv    = __ldcv(p);
-                    bool mismatch = (plain != acq) || (acq != cv);
-                    printf("[CHUNK D rank=%d peer=%d s=%d] plain=%d acq=%d cv=%d %s\n",
-                           rank, i, s, plain, acq, cv,
-                           mismatch ? "STALE" : "");
-                }
-            }
-        }
-        __syncthreads();
-
         // Reduce the number of tokens per rank/expert
         EP_DEVICE_ASSERT(num_nvl_experts <= num_threads);
         if (thread_id == 0) {
@@ -450,22 +358,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
         __syncthreads();
-
-        // [dyogev CHUNK_PROBE] Stage E: final moe_recv_expert_counter values
-        // that get returned to the test as recv_num_tokens_per_expert_list.
-        // If E disagrees with the L344 sum reconstructed from D, the host
-        // mapped-write path is suspect; otherwise the issue is fully upstream.
-        if (thread_id == 0) {
-            const int probe_s[] = {0, 24, 55, 56, 63};
-            #pragma unroll
-            for (int k = 0; k < 5; ++k) {
-                int s = probe_s[k];
-                if (s < num_nvl_experts) {
-                    printf("[CHUNK E rank=%d s=%d] moe_recv_expert_counter=%d\n",
-                           rank, s, moe_recv_expert_counter_mapped[s]);
-                }
-            }
-        }
 
         // Finally barrier
         if (warp_id == 1) {
