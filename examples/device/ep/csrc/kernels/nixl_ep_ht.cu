@@ -332,6 +332,19 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             #pragma unroll
             for (int i = 0; i < num_nvl_experts; ++i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
+            // [dyogev fix] System-scope fence to flush the cross-peer cuda_ipc
+            // writes above before the barrier_block. Writes via the cuda_ipc-
+            // mapped peer pointer can sit in this SM's L2 and propagate to
+            // peer HBM over NVLink asynchronously; barrier_block only
+            // synchronizes thread-level execution via the signal array, it
+            // does NOT drain in-flight peer-HBM writes. Previously masked by
+            // the 280us debug spin in notify_dispatch; with the spin removed
+            // (replaced by per-put nixlGpuGetXferStatus wait), the trailing
+            // entries of the 64-int per-expert table were not yet visible to
+            // the NVL peer when it read at L354 -> systematic loss of the
+            // "last N writes from peer 1" on rank 0 and "first N writes from
+            // peer 0" on rank 1.
+            __threadfence_system();
         }
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank, timeout_cycles);
 
