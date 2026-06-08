@@ -159,6 +159,35 @@ def _check_mask_no_false_positives(
         counters[1] += 1
 
 
+def _assign_kill_timing_for_phase(
+    global_rank: int,
+    ranks_to_kill: Set[int],
+    fault_kill_timings: List[str],
+) -> str:
+    """Return the fault-kill timing this rank should use for this phase.
+
+    Multi-victim policy: within a phase, the killed ranks are sorted
+    ascending by rank id and the i-th sorted victim is assigned
+    `fault_kill_timings[i]`. For example, with victims {5, 10} and
+    timings ["before-dispatch", "after-dispatch"], rank 5 is killed at
+    `before-dispatch` and rank 10 at `after-dispatch`.
+
+    Survivors (ranks not in this phase's kill set) return
+    `fault_kill_timings[0]`. The timing value is unused on survivors -- both
+    `maybe_schedule_self_kill` and `maybe_schedule_in_kernel_self_kill`
+    inside `test_main` short-circuit when `fault_tolerance_test=False`, which
+    is the case for any rank that is not the current-phase victim -- but we
+    pass a well-formed string for type consistency.
+
+    The caller MUST validate `len(fault_kill_timings) >= len(ranks_to_kill)`
+    before calling, so this function never reads past the array.
+    """
+    if global_rank not in ranks_to_kill:
+        return fault_kill_timings[0]
+    sorted_victims = sorted(ranks_to_kill)
+    return fault_kill_timings[sorted_victims.index(global_rank)]
+
+
 def _maybe_log_first_mask_detection(
     mask_status: torch.Tensor,
     rank: int,
@@ -937,6 +966,24 @@ def worker(torch_rank: int, args: argparse.Namespace):
         # Check if this rank should be killed
         kill_rank = global_rank in ranks_to_kill
 
+        # Multi-victim timing assignment: a phase can kill 1+ ranks; the user
+        # passes 1+ timings via `--fault-kill-timing`. The i-th victim in
+        # ascending rank-id order is killed at timings[i]. Validate we have
+        # enough timings BEFORE entering test_main so the failure is loud and
+        # early, not a buried IndexError inside the victim's kill helper.
+        if len(ranks_to_kill) > len(args.fault_kill_timing):
+            raise ValueError(
+                f"plan kills {len(ranks_to_kill)} ranks in phase "
+                f"{plan.get_phase()} ({sorted(ranks_to_kill)}) but only "
+                f"{len(args.fault_kill_timing)} fault-kill timing(s) were "
+                f"provided: {args.fault_kill_timing}. Pass at least "
+                f"{len(ranks_to_kill)} values to --fault-kill-timing, one per "
+                f"victim, in ascending rank-id order."
+            )
+        this_rank_timing = _assign_kill_timing_for_phase(
+            global_rank, ranks_to_kill, args.fault_kill_timing
+        )
+
         if len(cleanly_removed) > 0:
             print(
                 f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
@@ -970,7 +1017,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
             buffer,
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
-            fault_kill_timing=args.fault_kill_timing,
+            fault_kill_timing=this_rank_timing,
             fault_kill_signal=args.fault_kill_signal,
             in_kernel_fault_spin_cycles=args.in_kernel_fault_spin_cycles,
             fault_evidence_dir=args.fault_evidence_dir,
@@ -1059,6 +1106,7 @@ def main():
     )
     parser.add_argument(
         "--fault-kill-timing",
+        nargs="+",
         choices=(
             "before-dispatch",
             "after-dispatch",
@@ -1073,8 +1121,17 @@ def main():
             "combine-send-during-kernel",
             "combine-receive-during-kernel",
         ),
-        default="before-dispatch",
-        help="CPU-level or in-kernel timing for the fault-tolerance self kill.",
+        default=["before-dispatch"],
+        help=(
+            "CPU-level or in-kernel timing(s) for the fault-tolerance self kill. "
+            "Accepts one or more timings; when a phase kills multiple ranks, "
+            "the victims are sorted ascending by rank id and the i-th sorted "
+            "victim is killed at timings[i]. Single-timing usage "
+            "(e.g. `--fault-kill-timing before-dispatch`) is unchanged from "
+            "before; multi-timing usage looks like "
+            "`--fault-kill-timing before-dispatch after-dispatch` for a phase "
+            "that kills two ranks."
+        ),
     )
     parser.add_argument(
         "--fault-kill-signal",
