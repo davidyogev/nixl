@@ -918,7 +918,7 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
+                    if (mask_buffer_ptr[topk_idx_reg / num_local_experts] != 0)
                         continue;
 
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
@@ -959,7 +959,7 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
+                    if (mask_buffer_ptr[topk_idx_reg / num_local_experts] != 0)
                         continue;
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
 
