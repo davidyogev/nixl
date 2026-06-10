@@ -147,7 +147,12 @@ LAUNCHER_LOG="$RESULTS_DIR_HOST/launcher.log"
 exec > >(tee -a "$LAUNCHER_LOG") 2>&1
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-say() { echo "[$(ts)] [launcher] $*"; }
+# CRITICAL: write log lines to stderr, not stdout. The launcher uses
+# `pid=$(run_elastic_on ...)` to capture the bg srun pid via `echo $!`; if
+# say() wrote to stdout, every dispatch log line would also land in $pid and
+# `wait`/`kill -0` would explode on multi-line garbage. stderr still ends up
+# in the launcher log + terminal because of the outer `2>&1` after tee.
+say() { echo "[$(ts)] [launcher] $*" >&2; }
 
 say "===== launcher start ====="
 say "job=${SLURM_JOB_ID}"
@@ -197,23 +202,20 @@ chmod +x "$NODE_SCRIPT_HOST"
 say "wrote per-node startup script: ${NODE_SCRIPT_HOST}"
 
 # ---------------------------------------------------------------------------
-# 6. Resolve master IP that workers will use to reach the rank server.
-#    We ask the master node itself for `hostname -I` and take the first IP.
-#    This typically returns the primary eth/IB IP, which is reachable from
-#    siblings in the same allocation. If your cluster routes the rank server
-#    traffic over a specific fabric, override by exporting MASTER_IP before
-#    calling this script.
+# 6. Resolve the master endpoint workers will use to reach the rank server.
+#    Default: just use the SLURM-provided hostname ($MASTER_NODE). On a
+#    SLURM/InfiniBand cluster sibling nodes can always DNS-resolve each
+#    other's hostnames; this avoids the rabbit hole of picking the "right"
+#    IP from `hostname -I` (which often returns a link-local 169.254.x.x or
+#    a management interface as its first entry, neither of which workers
+#    can reach).
+#
+#    If your cluster requires a specific fabric IP for the rank-server
+#    traffic, override MASTER_IP=<addr> before invoking this script. Empty
+#    string means "use $MASTER_NODE".
 # ---------------------------------------------------------------------------
-if [[ -z "${MASTER_IP:-}" ]]; then
-    say "resolving master IP from ${MASTER_NODE} via 'hostname -I'..."
-    MASTER_IP=$(srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$MASTER_NODE" \
-        bash -c 'hostname -I | awk "{print \$1}"' 2>/dev/null | tr -d '[:space:]' || true)
-fi
-if [[ -z "$MASTER_IP" ]]; then
-    echo "error: could not resolve master IP for node ${MASTER_NODE}" >&2
-    exit 1
-fi
-say "master_ip=${MASTER_IP}"
+MASTER_ENDPOINT="${MASTER_IP:-$MASTER_NODE}"
+say "master_endpoint=${MASTER_ENDPOINT}  (override with MASTER_IP=... env var)"
 
 # ---------------------------------------------------------------------------
 # 7. Helper: dispatch an elastic.py invocation to a specific node, in
@@ -252,9 +254,10 @@ say "waiting ${WAIT_AFTER_MASTER_SECS}s for master rank server to bind & ranks 0
 sleep "$WAIT_AFTER_MASTER_SECS"
 
 if ! kill -0 "$MASTER_PID" 2>/dev/null; then
-    echo "error: master srun (pid=${MASTER_PID}) exited during head-start window; see master log." >&2
     say "===== launcher early-fail: master died during head-start ====="
-    wait "$MASTER_PID" || true
+    say "tail of master log (${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log):"
+    tail -n 50 "${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log" 2>&1 | sed "s/^/  /" >&2
+    wait "$MASTER_PID" 2>/dev/null || true
     exit 1
 fi
 
@@ -263,7 +266,7 @@ fi
 # ---------------------------------------------------------------------------
 declare -a WORKER_PIDS=()
 for w in "${WORKER_NODES[@]}"; do
-    pid=$(run_elastic_on "$w" "worker_${w}.log" --tcp-server "$MASTER_IP" "${EXTRA_ARGS[@]}")
+    pid=$(run_elastic_on "$w" "worker_${w}.log" --tcp-server "$MASTER_ENDPOINT" "${EXTRA_ARGS[@]}")
     WORKER_PIDS+=("$pid")
     say "worker ${w} pid (background srun) = ${pid}"
 done
