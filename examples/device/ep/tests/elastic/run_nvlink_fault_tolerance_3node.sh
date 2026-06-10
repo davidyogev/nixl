@@ -83,7 +83,10 @@ TOTAL_RANKS=$((NODES_REQUIRED * GPUS_PER_NODE))
 IMAGE=${IMAGE:-/lustre/fsw/portfolios/network/projects/network_research_advdev/users/dyogev/latest.sqsh}
 LUSTRE_NIXL=${LUSTRE_NIXL:-/lustre/fsw/portfolios/network/projects/network_research_advdev/users/dyogev/nixl}
 CTR_NIXL=${CTR_NIXL:-/workspace/nixl}
-MOUNT_SPEC="${LUSTRE_NIXL}:${CTR_NIXL}"
+# Optional extra bind-mounts, comma-separated (e.g. for sites where prebuilt
+# UCX or shared helper scripts live outside $LUSTRE_NIXL):
+#   EXTRA_MOUNTS="/lustre/.../lishapira:/workspace/lishapira"
+MOUNT_SPEC="${LUSTRE_NIXL}:${CTR_NIXL}${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 
 ELASTIC_DIR_CTR="${CTR_NIXL}/examples/device/ep/tests/elastic"
 # Maximum time to wait for the master to become ready (rank server bound +
@@ -190,21 +193,50 @@ cat > "$NODE_SCRIPT_HOST" <<'NODESCRIPT'
 # Per-node startup: sets up NIXL EP env in-container, then execs python3 with
 # the args passed to this script. Kept tiny and self-contained so the launcher
 # can dispatch identical commands to every node via a single srun line.
+#
+# Env hooks (set in the parent launcher's environment, forwarded by srun):
+#   NIXL_INSTALL   path to a built NIXL install prefix (default /workspace/nixl/install)
+#   UCX_PREFIX     optional UCX install prefix to prepend to LD_LIBRARY_PATH
+#   STARTUP_HOOK   optional path to a bash file to source first (e.g. a site
+#                  setup_node.sh that already sets PYTHONPATH/LD_LIBRARY_PATH/
+#                  NIXL_PLUGIN_DIR). When set, we trust it and skip our own
+#                  default exports.
 set -euo pipefail
 export NIXL_INSTALL=${NIXL_INSTALL:-/workspace/nixl/install}
-NIXL_EP_CPP=$(ls "${NIXL_INSTALL}"/lib/python3/dist-packages/nixl_ep/nixl_ep_cpp.cpython-*.so 2>/dev/null | head -n 1 || true)
-if [[ -z "${NIXL_EP_CPP}" ]]; then
-    echo "[node=$(hostname -s)] error: ${NIXL_INSTALL} does not contain a built nixl_ep module." >&2
-    echo "[node=$(hostname -s)] (Re)build first: meson setup nixl_build --prefix=${NIXL_INSTALL} -Ducx_path=/opt/hpcx/ucx -Dbuild_docs=false -Drust=false -Dbuild_nixl_ep=true -Dlibfabric_path=/opt/amazon/efa --buildtype=release && ninja -C nixl_build install" >&2
-    exit 1
+
+if [[ -n "${STARTUP_HOOK:-}" ]]; then
+    if [[ ! -f "${STARTUP_HOOK}" ]]; then
+        echo "[node=$(hostname -s)] error: STARTUP_HOOK file not found: ${STARTUP_HOOK}" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "${STARTUP_HOOK}"
+else
+    NIXL_EP_CPP=$(ls "${NIXL_INSTALL}"/lib/python3/dist-packages/nixl_ep/nixl_ep_cpp.cpython-*.so 2>/dev/null | head -n 1 || true)
+    if [[ -z "${NIXL_EP_CPP}" ]]; then
+        echo "[node=$(hostname -s)] error: ${NIXL_INSTALL} does not contain a built nixl_ep module." >&2
+        echo "[node=$(hostname -s)] (Re)build first using your site's build_nixl script, e.g.:" >&2
+        echo "[node=$(hostname -s)]   NIXL_PREFIX=${NIXL_INSTALL} bash /workspace/lishapira/build_nixl_aarch64.sh" >&2
+        exit 1
+    fi
+    # Auto-detect the per-arch lib subdir (aarch64-linux-gnu, x86_64-linux-gnu, etc).
+    ARCH_LIB_DIR=$(ls -d "${NIXL_INSTALL}"/lib/*-linux-gnu 2>/dev/null | head -n 1 || true)
+    if [[ -z "${ARCH_LIB_DIR}" ]]; then
+        echo "[node=$(hostname -s)] error: no per-arch lib dir under ${NIXL_INSTALL}/lib (expected aarch64-linux-gnu or x86_64-linux-gnu)." >&2
+        exit 1
+    fi
+    export PYTHONPATH=${NIXL_INSTALL}/lib/python3/dist-packages:${PYTHONPATH:-}
+    export LD_LIBRARY_PATH=${ARCH_LIB_DIR}:${UCX_PREFIX:+${UCX_PREFIX}/lib:}${LD_LIBRARY_PATH:-}
+    export NIXL_PLUGIN_DIR=${ARCH_LIB_DIR}/plugins
 fi
-export PYTHONPATH=${NIXL_INSTALL}/lib/python3/dist-packages:${PYTHONPATH:-}
-export LD_LIBRARY_PATH=${NIXL_INSTALL}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
-export NIXL_PLUGIN_DIR=${NIXL_INSTALL}/lib/x86_64-linux-gnu/plugins
+
 unset UCX_TLS
 export PYTHONUNBUFFERED=1
 echo "[node=$(hostname -s)] $(date -u +%Y-%m-%dT%H:%M:%SZ) startup: python3 $*"
 echo "[node=$(hostname -s)] NIXL_INSTALL=${NIXL_INSTALL}"
+echo "[node=$(hostname -s)] PYTHONPATH=${PYTHONPATH:-(unset)}"
+echo "[node=$(hostname -s)] LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-(unset)}"
+echo "[node=$(hostname -s)] NIXL_PLUGIN_DIR=${NIXL_PLUGIN_DIR:-(unset)}"
 echo "[node=$(hostname -s)] cuda_devices=$(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null | wc -l)"
 exec python3 "$@"
 NODESCRIPT
