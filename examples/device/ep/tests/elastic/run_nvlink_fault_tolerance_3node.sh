@@ -86,7 +86,17 @@ CTR_NIXL=${CTR_NIXL:-/workspace/nixl}
 MOUNT_SPEC="${LUSTRE_NIXL}:${CTR_NIXL}"
 
 ELASTIC_DIR_CTR="${CTR_NIXL}/examples/device/ep/tests/elastic"
-WAIT_AFTER_MASTER_SECS=${WAIT_AFTER_MASTER_SECS:-25}
+# Maximum time to wait for the master to become ready (rank server bound +
+# GPUS_PER_NODE workers registered). The launcher actively polls the master
+# log; this is just the upper bound before we give up. Cold container start
+# can take ~20s on a chilly cache; we allow generous headroom but exit as
+# soon as ranks are registered, usually within 5-10s.
+MASTER_READY_TIMEOUT_SECS=${MASTER_READY_TIMEOUT_SECS:-60}
+MASTER_READY_POLL_INTERVAL_SECS=${MASTER_READY_POLL_INTERVAL_SECS:-1}
+# Optional floor wait AFTER ranks register (e.g. set to 2 if you want to be
+# extra-safe that the rank server has fully transitioned before letting
+# worker nodes connect). Default 0: proceed immediately.
+WAIT_AFTER_MASTER_READY_SECS=${WAIT_AFTER_MASTER_READY_SECS:-0}
 SETTLE_SECONDS=${SETTLE_SECONDS:-5}
 
 # ---------------------------------------------------------------------------
@@ -164,7 +174,7 @@ say "mount=${MOUNT_SPEC}"
 say "plan(host)=${LUSTRE_NIXL}/examples/device/ep/tests/elastic/${PLAN_FILE}"
 say "plan(ctr) =${PLAN_FILE_CTR}"
 say "smoke=${SMOKE} gpus_per_node=${GPUS_PER_NODE} total_ranks=${TOTAL_RANKS}"
-say "wait_after_master_secs=${WAIT_AFTER_MASTER_SECS}"
+say "master_ready_timeout_secs=${MASTER_READY_TIMEOUT_SECS} poll=${MASTER_READY_POLL_INTERVAL_SECS}s wait_after_master_ready_secs=${WAIT_AFTER_MASTER_READY_SECS}"
 say "extra_args=${EXTRA_ARGS[*]:-(none)}"
 say "results_dir(host)=${RESULTS_DIR_HOST}"
 say "results_dir(ctr) =${RESULTS_DIR_CTR}"
@@ -218,6 +228,56 @@ MASTER_ENDPOINT="${MASTER_IP:-$MASTER_NODE}"
 say "master_endpoint=${MASTER_ENDPOINT}  (override with MASTER_IP=... env var)"
 
 # ---------------------------------------------------------------------------
+# 6b. EXIT trap: kill any bg srun jobs we spawned so they don't outlive the
+#     launcher and hog ports / GPU memory for the next attempt. Without this
+#     trap, an early-fail (e.g. EADDRINUSE on master) leaves the worker srun
+#     bg jobs running and the next launcher run collides with them on
+#     port 9999/10000.
+# ---------------------------------------------------------------------------
+MASTER_PID=""
+declare -a WORKER_PIDS=()
+cleanup_bg_srun() {
+    local rc=$?
+    local p
+    for p in "$MASTER_PID" "${WORKER_PIDS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        if kill -0 "$p" 2>/dev/null; then
+            say "trap: terminating bg srun pid=$p"
+            kill -TERM "$p" 2>/dev/null || true
+        fi
+    done
+    # Give srun a moment to propagate the signal to its job step.
+    sleep 1
+    for p in "$MASTER_PID" "${WORKER_PIDS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        if kill -0 "$p" 2>/dev/null; then
+            kill -KILL "$p" 2>/dev/null || true
+        fi
+    done
+    exit "$rc"
+}
+trap cleanup_bg_srun EXIT
+
+# ---------------------------------------------------------------------------
+# 6c. Pre-flight: make sure the master's rank-server ports aren't already
+#     held by an orphan from a previous run. If they are, bail loudly --
+#     the actual elastic.py would crash with EADDRINUSE several seconds
+#     later, after a useless container start.
+# ---------------------------------------------------------------------------
+say "pre-flight: checking master ports 9999/10000 are free on ${MASTER_NODE}..."
+port_check=$(srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$MASTER_NODE" \
+    bash -c '{ ss -tln 2>/dev/null || netstat -tln 2>/dev/null || true; } | awk "\$4 ~ /:(9999|10000)\$/ {print \$4}"' 2>/dev/null || true)
+if [[ -n "$port_check" ]]; then
+    say "FATAL: rank-server ports already in use on ${MASTER_NODE}:"
+    echo "$port_check" | sed "s/^/  /" >&2
+    say "An orphan from a previous run is holding the ports. Cleanup:"
+    say "  scancel \$SLURM_JOB_ID   # then re-allocate (-N 3 ... --pty bash)"
+    say "(this also nukes your current --pty shell -- re-srun to come back.)"
+    exit 1
+fi
+say "pre-flight: master ports clear"
+
+# ---------------------------------------------------------------------------
 # 7. Helper: dispatch an elastic.py invocation to a specific node, in
 #    container, in background. Returns the bg pid via echo.
 # ---------------------------------------------------------------------------
@@ -244,27 +304,57 @@ run_elastic_on() {
 # 8. Start master (no --tcp-server -- it hosts TCPStore + rank server).
 # ---------------------------------------------------------------------------
 say "starting MASTER on ${MASTER_NODE}..."
+MASTER_LOG="${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log"
 MASTER_PID=$(run_elastic_on "$MASTER_NODE" "master_${MASTER_NODE}.log" "${EXTRA_ARGS[@]}")
 say "master pid (background srun) = ${MASTER_PID}"
 
-# Give the master a head start: container cold-start + rank-server bind +
-# rank 0,1 registration. If this is too short the worker nodes will steal
-# ranks 0,1 and the test will kill the wrong physical node.
-say "waiting ${WAIT_AFTER_MASTER_SECS}s for master rank server to bind & ranks 0,1 to register..."
-sleep "$WAIT_AFTER_MASTER_SECS"
-
-if ! kill -0 "$MASTER_PID" 2>/dev/null; then
-    say "===== launcher early-fail: master died during head-start ====="
-    say "tail of master log (${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log):"
-    tail -n 50 "${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log" 2>&1 | sed "s/^/  /" >&2
-    wait "$MASTER_PID" 2>/dev/null || true
+# Wait until the master is READY = GPUS_PER_NODE workers have registered
+# with the rank server. We poll the master log for lines like:
+#     "Process <torch_pid> -> global_rank=<n>, local_rank=<m>"
+# Once we see GPUS_PER_NODE such lines, ranks 0..GPUS_PER_NODE-1 are pinned
+# to the master and it's safe to launch the worker nodes. This is
+# dramatically faster than a flat sleep (~5-10s hot, vs. having to assume
+# a worst-case 25s+ cold start), AND it can't proceed early when the
+# cluster is slow.
+say "polling master log for ${GPUS_PER_NODE} rank registrations (timeout=${MASTER_READY_TIMEOUT_SECS}s)..."
+deadline=$(( $(date +%s) + MASTER_READY_TIMEOUT_SECS ))
+master_ready=0
+while (( $(date +%s) < deadline )); do
+    if ! kill -0 "$MASTER_PID" 2>/dev/null; then
+        say "===== launcher early-fail: master died before becoming ready ====="
+        say "tail of master log (${MASTER_LOG}):"
+        tail -n 50 "$MASTER_LOG" 2>&1 | sed "s/^/  /" >&2
+        wait "$MASTER_PID" 2>/dev/null || true
+        exit 1
+    fi
+    if [[ -f "$MASTER_LOG" ]]; then
+        n_registered=$(grep -c '^Process [0-9]\+ -> global_rank=' "$MASTER_LOG" 2>/dev/null || echo 0)
+        if (( n_registered >= GPUS_PER_NODE )); then
+            elapsed=$(( $(date +%s) - (deadline - MASTER_READY_TIMEOUT_SECS) ))
+            say "master ready: ${n_registered}/${GPUS_PER_NODE} ranks registered after ${elapsed}s"
+            master_ready=1
+            break
+        fi
+    fi
+    sleep "$MASTER_READY_POLL_INTERVAL_SECS"
+done
+if (( master_ready == 0 )); then
+    say "===== launcher early-fail: master did not register ${GPUS_PER_NODE} ranks within ${MASTER_READY_TIMEOUT_SECS}s ====="
+    say "tail of master log (${MASTER_LOG}):"
+    tail -n 50 "$MASTER_LOG" 2>&1 | sed "s/^/  /" >&2
     exit 1
+fi
+
+if (( WAIT_AFTER_MASTER_READY_SECS > 0 )); then
+    say "optional floor wait: sleeping ${WAIT_AFTER_MASTER_READY_SECS}s after master ready..."
+    sleep "$WAIT_AFTER_MASTER_READY_SECS"
 fi
 
 # ---------------------------------------------------------------------------
 # 9. Start the other 2 nodes (they connect to the master's rank server).
 # ---------------------------------------------------------------------------
-declare -a WORKER_PIDS=()
+# WORKER_PIDS was pre-declared near the EXIT trap so the trap can see it
+# even if we early-fail before this loop runs.
 for w in "${WORKER_NODES[@]}"; do
     pid=$(run_elastic_on "$w" "worker_${w}.log" --tcp-server "$MASTER_ENDPOINT" "${EXTRA_ARGS[@]}")
     WORKER_PIDS+=("$pid")
