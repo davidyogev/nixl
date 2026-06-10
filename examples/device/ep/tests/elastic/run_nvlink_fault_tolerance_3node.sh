@@ -311,8 +311,16 @@ say "pre-flight: master ports clear"
 
 # ---------------------------------------------------------------------------
 # 7. Helper: dispatch an elastic.py invocation to a specific node, in
-#    container, in background. Returns the bg pid via echo.
+#    container, in background. Returns the bg pid via the global
+#    DISPATCH_PID. We deliberately do NOT use `pid=$(run_elastic_on ...)` to
+#    capture the pid: `$()` runs the function in a subshell, the `srun &`
+#    backgrounds inside that subshell, and the moment the subshell exits the
+#    bg pid is reparented to init -- the parent launcher can no longer
+#    `wait` on it ("not a child of this shell" -> instant rc=127 for every
+#    node). Setting a global side-effect and calling without `$()` keeps the
+#    bg srun as a direct child of the parent launcher.
 # ---------------------------------------------------------------------------
+DISPATCH_PID=""
 run_elastic_on() {
     local node="$1" log_name="$2"
     shift 2
@@ -329,7 +337,7 @@ run_elastic_on() {
             --num-processes "$GPUS_PER_NODE" \
             "$@" \
         > "$log_file" 2>&1 &
-    echo $!
+    DISPATCH_PID=$!
 }
 
 # ---------------------------------------------------------------------------
@@ -337,7 +345,8 @@ run_elastic_on() {
 # ---------------------------------------------------------------------------
 say "starting MASTER on ${MASTER_NODE}..."
 MASTER_LOG="${RESULTS_DIR_HOST}/master_${MASTER_NODE}.log"
-MASTER_PID=$(run_elastic_on "$MASTER_NODE" "master_${MASTER_NODE}.log" "${EXTRA_ARGS[@]}")
+run_elastic_on "$MASTER_NODE" "master_${MASTER_NODE}.log" "${EXTRA_ARGS[@]}"
+MASTER_PID="$DISPATCH_PID"
 say "master pid (background srun) = ${MASTER_PID}"
 
 # Wait until the master is READY = GPUS_PER_NODE workers have registered
@@ -360,7 +369,11 @@ while (( $(date +%s) < deadline )); do
         exit 1
     fi
     if [[ -f "$MASTER_LOG" ]]; then
-        n_registered=$(grep -c '^Process [0-9]\+ -> global_rank=' "$MASTER_LOG" 2>/dev/null || echo 0)
+        # grep -c prints "0" AND exits non-zero on no-match; without `|| true`
+        # the previous `|| echo 0` form appended a SECOND "0", and the loop
+        # tripped on `(( "0\n0" >= GPUS_PER_NODE ))` parse errors every poll.
+        n_registered=$(grep -c '^Process [0-9]\+ -> global_rank=' "$MASTER_LOG" 2>/dev/null || true)
+        n_registered=${n_registered:-0}
         if (( n_registered >= GPUS_PER_NODE )); then
             elapsed=$(( $(date +%s) - (deadline - MASTER_READY_TIMEOUT_SECS) ))
             say "master ready: ${n_registered}/${GPUS_PER_NODE} ranks registered after ${elapsed}s"
@@ -388,9 +401,9 @@ fi
 # WORKER_PIDS was pre-declared near the EXIT trap so the trap can see it
 # even if we early-fail before this loop runs.
 for w in "${WORKER_NODES[@]}"; do
-    pid=$(run_elastic_on "$w" "worker_${w}.log" --tcp-server "$MASTER_ENDPOINT" "${EXTRA_ARGS[@]}")
-    WORKER_PIDS+=("$pid")
-    say "worker ${w} pid (background srun) = ${pid}"
+    run_elastic_on "$w" "worker_${w}.log" --tcp-server "$MASTER_ENDPOINT" "${EXTRA_ARGS[@]}"
+    WORKER_PIDS+=("$DISPATCH_PID")
+    say "worker ${w} pid (background srun) = ${DISPATCH_PID}"
 done
 
 # ---------------------------------------------------------------------------
@@ -442,7 +455,18 @@ CLEANUP_LOG="$RESULTS_DIR_HOST/cleanup_report.log"
             bash -lc '
                 set +e
                 echo "hostname=$(hostname -s)"
-                lp=$({ pgrep -af "elastic\.py|rank_server|spawn_main|torch.multiprocessing" 2>/dev/null || true; } | wc -l)
+                # NOTE: pgrep -af "<pattern>" matches its own argv (the
+                # pattern string is literally part of the pgrep cmdline),
+                # AND it matches the surrounding bash -lc wrapper here, AND
+                # on the master node also the outer srun ... bash -lc issuer.
+                # That produced false leftover_procs=5 on master / 3 on
+                # workers on a clean shutdown despite ports / GPU mem /
+                # compute apps all being 0. Filter the obvious self-matches
+                # so the count reflects actual leaked python workers and
+                # rank_server only.
+                lp=$({ pgrep -af "elastic\.py|rank_server|spawn_main|torch.multiprocessing" 2>/dev/null || true; } \
+                      | grep -Ev "pgrep -af|bash -l?c" \
+                      | wc -l)
                 echo "leftover_procs=${lp}"
                 shm=$({ ls /dev/shm/torch_* /dev/shm/cuda.shm.* 2>/dev/null || true; } | wc -l)
                 echo "shm_torch_files=${shm}"
