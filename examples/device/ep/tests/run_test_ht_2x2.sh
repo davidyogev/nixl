@@ -39,10 +39,24 @@ if [[ ! -f /workspace/nixl/install/lib/python3/dist-packages/nixl_ep/nixl_ep_cpp
     exit 1
 fi
 
-# Force UCX to use the NIC for cross-island endpoints instead of cuda_ipc.
-# Override on the command line (e.g. UCX_TLS=... bash run_test_ht_2x2.sh) if a
-# different transport mix is needed.
-export UCX_TLS=${UCX_TLS:-^cuda_ipc}
+# Build the per-island hostname shim. UCX classifies endpoints as
+# intra-vs-inter-node via gethostname() comparison. Without this shim, all 4
+# ranks on a single physical host look intra-node to UCX, so it picks cuda_ipc
+# for the device lane on every endpoint -- defeating the 2x2 RDMA test.
+# With the shim, test_ht.py sets UCX_FAKE_HOSTNAME per-island, so cross-island
+# endpoints look inter-node to UCX and rc_gda becomes eligible. Within an
+# island the hostnames match, so UCX still picks cuda_ipc/NVL as intended.
+SHIM_SRC="$(dirname "$0")/island_hostname.c"
+SHIM_SO="${TMPDIR:-/tmp}/island_hostname.so"
+if [[ ! -f "$SHIM_SO" || "$SHIM_SRC" -nt "$SHIM_SO" ]]; then
+    gcc -O2 -shared -fPIC -ldl "$SHIM_SRC" -o "$SHIM_SO"
+fi
+export LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+
+# UCX_TLS=all keeps every transport eligible -- the per-island hostname trick
+# above (not a TLS restriction) is what redirects cross-island traffic off
+# cuda_ipc and onto rc_gda. Override UCX_TLS on the command line if needed.
+export UCX_TLS=${UCX_TLS:-all}
 export PYTHONPATH=/workspace/nixl/install/lib/python3/dist-packages:${PYTHONPATH:-}
 export LD_LIBRARY_PATH=/workspace/nixl/install/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
 export NIXL_PLUGIN_DIR=/workspace/nixl/install/lib/x86_64-linux-gnu/plugins

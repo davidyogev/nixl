@@ -515,6 +515,18 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     torch.set_default_device("cuda")
     torch.cuda.set_device(local_rank % 8)
 
+    # [dyogev patch] Per-island fake hostname so the LD_PRELOAD shim in
+    # island_hostname.so reports a unique hostname per NVL island. UCX uses
+    # hostname comparison to classify endpoints as intra-node vs inter-node:
+    # within an island (same fake hostname) UCX still picks cuda_ipc for the
+    # device lane (preserving the NVL fast path); across islands (different
+    # fake hostnames) UCX is eligible to use rc_gda, enabling real
+    # kernel-issued RDMA on a single physical host.
+    # Must be set before nixl_ep.Buffer() because UCX reads hostname during
+    # UCP context construction. No-op if the LD_PRELOAD shim isn't loaded.
+    _island_id = local_rank // num_local_ranks
+    os.environ["UCX_FAKE_HOSTNAME"] = f"ep-island-{_island_id}"
+
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
 
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
