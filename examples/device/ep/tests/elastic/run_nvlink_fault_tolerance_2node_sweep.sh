@@ -80,6 +80,13 @@ SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 FAULT_KILL_SIGNAL="${FAULT_KILL_SIGNAL:-sigkill}"
 
+# Per-clone setup script + test dir paths (container-side). step.sh sources
+# the setup script and cds into the test dir before running elastic.py; the
+# build-sanity probe sources the same setup script. Defaults match this
+# clone's location at /workspace/dyogev/nixl-4165b16.
+export FT_SETUP_NODE_SH="${FT_SETUP_NODE_SH:-/workspace/dyogev/nixl-4165b16/setup_node.sh}"
+export FT_TEST_DIR="${FT_TEST_DIR:-/workspace/dyogev/nixl-4165b16/examples/device/ep/tests/elastic}"
+
 DEFAULT_TIMINGS=(
     # CPU-level kills
     before-dispatch
@@ -186,9 +193,15 @@ JOB_TAG="${SLURM_JOB_ID}"
 RUN_DIR_HOST="${RUN_DIR:-${TEST_DIR}/results/2node_${UTC}_job${JOB_TAG}_${NODES_STR}}"
 RUN_DIR_CONTAINER=$(host_to_container_path "${RUN_DIR_HOST}")
 mkdir -p "${RUN_DIR_HOST}"
+# Open perms so the in-container step.sh (running as the launching user, who
+# may not be in this tree's primary group) can create per-rank log files via
+# tee. mkdir defaults to ~0755 + setgid, which leaves "others" with no write
+# even when the parent is 2777, so we explicitly chmod each created dir.
+chmod 2777 "${RUN_DIR_HOST}" 2>/dev/null || true
 EVIDENCE_DIR_HOST="${RUN_DIR_HOST}/evidence"
 EVIDENCE_DIR_CONTAINER=$(host_to_container_path "${EVIDENCE_DIR_HOST}")
 mkdir -p "${EVIDENCE_DIR_HOST}"
+chmod 2777 "${EVIDENCE_DIR_HOST}" 2>/dev/null || true
 SUMMARY="${RUN_DIR_HOST}/SUMMARY.md"
 
 log_summary() { printf '%s\n' "$*" >> "${SUMMARY}"; }
@@ -200,7 +213,8 @@ log_summary() { printf '%s\n' "$*" >> "${SUMMARY}"; }
 # ---------------------------------------------------------------------------
 verify_build() {
     local probe_log="${RUN_DIR_HOST}/build_probe.log"
-    local probe_py='source /workspace/lishapira/setup_node.sh >/dev/null 2>&1
+    local setup_sh="${FT_SETUP_NODE_SH:-/workspace/dyogev/nixl-4165b16/setup_node.sh}"
+    local probe_py='source '"${setup_sh}"' >/dev/null 2>&1
 python3 - <<'\''PY'\''
 import nixl_ep
 needed = (
@@ -219,7 +233,7 @@ PY'
         --nodes=1 --ntasks=1 --nodelist="${MASTER_HOST}" \
         --container-image="${CONTAINER_IMAGE}" \
         --container-mounts="${CONTAINER_MOUNTS}" \
-        --container-workdir=/workspace/lishapira \
+        --container-workdir=/workspace/dyogev \
         bash -c "${probe_py}" 2>&1)
     {
         echo "=== build probe (srun on ${MASTER_HOST}, in container) ==="
@@ -234,10 +248,107 @@ PY'
 }
 
 # ---------------------------------------------------------------------------
-# run_one: launch ONE srun step that drives both nodes.
+# Master-ready polling knobs (port of davidyogev's nvlink-fault-tolerance-3node
+# launcher commits e315aa3 "poll for ready + clean up bg srun" and 34a5535
+# "fix wait/poll/cleanup bugs surfaced on Lyris"). The previous single
+# `srun -N2 --ntasks-per-node=1` had master and worker race for rank-server
+# binding; on Lyris the master sometimes hadn't bound port 10000 by the time
+# the worker tried to connect, the master's own children failed at
+# `RankClient.get_rank()`, and `torch.multiprocessing` swallowed the
+# traceback into "Worker processes failed: ... exit code 1".
+# ---------------------------------------------------------------------------
+MASTER_READY_TIMEOUT_SECS="${MASTER_READY_TIMEOUT_SECS:-60}"
+MASTER_READY_POLL_INTERVAL_SECS="${MASTER_READY_POLL_INTERVAL_SECS:-1}"
+WAIT_AFTER_MASTER_READY_SECS="${WAIT_AFTER_MASTER_READY_SECS:-0}"
+
+# ---------------------------------------------------------------------------
+# Per-iteration EXIT trap state. We launch master + worker as background
+# srun jobs; if the orchestrator dies (^C, error in caller) we don't want
+# them outliving us and holding ports 9999/10000 for the next iteration.
+# Updated by run_one before/after each launch; cleanup_bg_srun walks both.
+# ---------------------------------------------------------------------------
+RUN_ONE_MASTER_PID=""
+RUN_ONE_WORKER_PID=""
+cleanup_bg_srun() {
+    local rc=$?
+    local p
+    for p in "${RUN_ONE_MASTER_PID}" "${RUN_ONE_WORKER_PID}"; do
+        [[ -z "${p}" ]] && continue
+        if kill -0 "${p}" 2>/dev/null; then
+            echo "[2node-sweep] trap: terminating bg srun pid=${p}" >&2
+            kill -TERM "${p}" 2>/dev/null || true
+        fi
+    done
+    sleep 1
+    for p in "${RUN_ONE_MASTER_PID}" "${RUN_ONE_WORKER_PID}"; do
+        [[ -z "${p}" ]] && continue
+        if kill -0 "${p}" 2>/dev/null; then
+            kill -KILL "${p}" 2>/dev/null || true
+        fi
+    done
+    return "${rc}"
+}
+trap 'cleanup_bg_srun; exit' INT TERM
+trap 'cleanup_bg_srun' EXIT
+
+# ---------------------------------------------------------------------------
+# preflight_master_ports: srun a quick `ss -tln` on the master and bail if
+# ports 9999 (TCPStore) or 10000 (rank server) are still held by an orphan
+# from a previous iteration. Without this, elastic.py would crash with
+# EADDRINUSE inside a freshly-started container ~5s into the run --
+# expensive way to learn we have a leak.
+# ---------------------------------------------------------------------------
+preflight_master_ports() {
+    local hits
+    hits=$(srun --jobid="${SLURM_JOB_ID}" --overlap \
+        --nodes=1 --ntasks=1 --nodelist="${MASTER_HOST}" \
+        bash -c '{ ss -tln 2>/dev/null || netstat -tln 2>/dev/null || true; } | awk "\$4 ~ /:(9999|10000)\$/ {print \$4}"' \
+        2>/dev/null || true)
+    if [[ -n "${hits}" ]]; then
+        echo "[2node-sweep] preflight FAIL: master ${MASTER_HOST} already holds these ports:" >&2
+        echo "${hits}" | sed "s/^/  /" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# launch_one_node: dispatch a single-node srun in background, capture the
+# bg pid via the global LAUNCH_BG_PID side effect (NOT $() -- $() runs in a
+# subshell; the bg srun reparents to init the moment the subshell exits and
+# the parent can no longer `wait` on it -> instant rc=127 even though
+# elastic.py is running fine. davidyogev's commit 34a5535 hit and fixed
+# this exact bug on Lyris).
+# ---------------------------------------------------------------------------
+LAUNCH_BG_PID=""
+launch_one_node() {
+    local node="$1"; shift
+    local log_file="$1"; shift
+    local role_env="$1"; shift   # "FT_NODEID=0" or "FT_NODEID=1"
+    local extra_export="$1"; shift  # comma-prefixed extras or empty
+    local timing="$1"; shift
+    local iter="$1"; shift
+    local plan="$1"; shift
+
+    srun --jobid="${SLURM_JOB_ID}" --overlap \
+        --nodes=1 --ntasks=1 --nodelist="${node}" \
+        --container-image="${CONTAINER_IMAGE}" \
+        --container-mounts="${CONTAINER_MOUNTS}" \
+        --container-workdir=/workspace/dyogev \
+        --export=ALL,RUN_DIR="${RUN_DIR_CONTAINER}",TIMING="${timing}",ITER="${iter}",PLAN_FILE="${plan}",FAULT_EVIDENCE_DIR="${EVIDENCE_DIR_CONTAINER}",NUM_PROCESSES="${NUM_PROCESSES}",FAULT_KILL_SIGNAL="${FAULT_KILL_SIGNAL}",SETTLE_SECONDS="${SETTLE_SECONDS}",MEM_LEAK_MIB="${MEM_LEAK_MIB}",MASTER_HOST="${MASTER_HOST}",FT_SETUP_NODE_SH="${FT_SETUP_NODE_SH}",FT_TEST_DIR="${FT_TEST_DIR}",${role_env}${extra_export} \
+        bash "${STEP_SCRIPT_CONTAINER}" "$@" \
+        > "${log_file}" 2>&1 &
+    LAUNCH_BG_PID=$!
+}
+
+# ---------------------------------------------------------------------------
+# run_one: launch master first, poll for readiness (NUM_PROCESSES rank
+# registrations in master log), then launch worker. Wait for both to
+# finish, concatenate per-node logs into the combined out_log so the
+# orchestrator's parser sees the same byte stream it always has.
 #
 #   $1 = plan filename (victim or baseline)
-#   $2 = output combined log path (host side; srun stdout goes here)
+#   $2 = output combined log path (host side; concatenation of master+worker)
 #   $3 = timing label
 #   $4 = iteration number
 #   rest = passed verbatim to elastic.py (e.g. --fault-kill-timing ...)
@@ -248,15 +359,87 @@ run_one() {
     local timing="$1"; shift
     local iter="$1"; shift
 
-    srun --jobid="${SLURM_JOB_ID}" --overlap \
-        --nodes=2 --ntasks-per-node=1 \
-        --nodelist="${MASTER_HOST},${WORKER_HOST}" \
-        --container-image="${CONTAINER_IMAGE}" \
-        --container-mounts="${CONTAINER_MOUNTS}" \
-        --container-workdir=/workspace/lishapira \
-        --export=ALL,RUN_DIR="${RUN_DIR_CONTAINER}",TIMING="${timing}",ITER="${iter}",PLAN_FILE="${plan}",FAULT_EVIDENCE_DIR="${EVIDENCE_DIR_CONTAINER}",NUM_PROCESSES="${NUM_PROCESSES}",FAULT_KILL_SIGNAL="${FAULT_KILL_SIGNAL}",SETTLE_SECONDS="${SETTLE_SECONDS}",MEM_LEAK_MIB="${MEM_LEAK_MIB}",MASTER_HOST="${MASTER_HOST}" \
-        bash "${STEP_SCRIPT_CONTAINER}" "$@" \
-        > "${out_log}" 2>&1
+    local master_log="${out_log}.master"
+    local worker_log="${out_log}.worker"
+    : > "${master_log}"
+    : > "${worker_log}"
+
+    # Pre-flight: ports 9999/10000 free on master.
+    if ! preflight_master_ports; then
+        echo "[2node-sweep] aborting iteration; cleanup with: scancel ${SLURM_JOB_ID}" >&2
+        cat "${master_log}" "${worker_log}" > "${out_log}" 2>/dev/null || true
+        return 2
+    fi
+
+    # ---- Phase 1: launch master, poll until ready --------------------------
+    launch_one_node "${MASTER_HOST}" "${master_log}" "FT_NODEID=0" "" \
+        "${timing}" "${iter}" "${plan}" "$@"
+    RUN_ONE_MASTER_PID="${LAUNCH_BG_PID}"
+
+    local deadline=$(( $(date +%s) + MASTER_READY_TIMEOUT_SECS ))
+    local master_ready=0
+    local n_registered=0
+    while (( $(date +%s) < deadline )); do
+        if ! kill -0 "${RUN_ONE_MASTER_PID}" 2>/dev/null; then
+            echo "[2node-sweep] master ${MASTER_HOST} died during head-start; tail of ${master_log}:" >&2
+            tail -n 30 "${master_log}" 2>&1 | sed "s/^/  /" >&2
+            wait "${RUN_ONE_MASTER_PID}" 2>/dev/null || true
+            local mrc=$?
+            cat "${master_log}" "${worker_log}" > "${out_log}" 2>/dev/null || true
+            RUN_ONE_MASTER_PID=""
+            return "${mrc}"
+        fi
+        if [[ -f "${master_log}" ]]; then
+            # `grep -c ... || true; ${var:-0}` defends against grep's
+            # exit-1-on-no-match (davidyogev commit 34a5535 fixed the
+            # `|| echo 0` form which produced "0\n0" and crashed (( ... )).
+            n_registered=$(grep -c '^Process [0-9]\+ -> global_rank=' "${master_log}" 2>/dev/null || true)
+            n_registered=${n_registered:-0}
+            if (( n_registered >= NUM_PROCESSES )); then
+                master_ready=1
+                break
+            fi
+        fi
+        sleep "${MASTER_READY_POLL_INTERVAL_SECS}"
+    done
+
+    if (( master_ready == 0 )); then
+        echo "[2node-sweep] master not ready (${n_registered}/${NUM_PROCESSES} ranks) after ${MASTER_READY_TIMEOUT_SECS}s; tail of ${master_log}:" >&2
+        tail -n 30 "${master_log}" 2>&1 | sed "s/^/  /" >&2
+        kill -TERM "${RUN_ONE_MASTER_PID}" 2>/dev/null || true
+        wait "${RUN_ONE_MASTER_PID}" 2>/dev/null || true
+        cat "${master_log}" "${worker_log}" > "${out_log}" 2>/dev/null || true
+        RUN_ONE_MASTER_PID=""
+        return 1
+    fi
+
+    if (( WAIT_AFTER_MASTER_READY_SECS > 0 )); then
+        sleep "${WAIT_AFTER_MASTER_READY_SECS}"
+    fi
+
+    # ---- Phase 2: launch worker --------------------------------------------
+    launch_one_node "${WORKER_HOST}" "${worker_log}" "FT_NODEID=1" "" \
+        "${timing}" "${iter}" "${plan}" "$@"
+    RUN_ONE_WORKER_PID="${LAUNCH_BG_PID}"
+
+    # ---- Wait for both. We collect both rcs but return the worse of the two.
+    wait "${RUN_ONE_WORKER_PID}"
+    local worker_rc=$?
+    RUN_ONE_WORKER_PID=""
+    wait "${RUN_ONE_MASTER_PID}"
+    local master_rc=$?
+    RUN_ONE_MASTER_PID=""
+
+    # Concatenate per-node logs into the combined log the parser expects.
+    # Master first so its CLEANUP REPORT [rank=0 ...] precedes worker's;
+    # fault-evidence files go to ${EVIDENCE_DIR_CONTAINER} regardless.
+    cat "${master_log}" "${worker_log}" > "${out_log}"
+    rm -f "${master_log}" "${worker_log}"
+
+    if (( master_rc != 0 )); then
+        return "${master_rc}"
+    fi
+    return "${worker_rc}"
 }
 
 # ---------------------------------------------------------------------------
@@ -319,18 +502,70 @@ rank_log_path() {
 }
 
 # ---------------------------------------------------------------------------
+# parse_cleanup_from_combined_log: extract the per-rank CLEANUP REPORT block
+# out of the combined srun log. Each block starts with a header line of the
+# form:
+#   ===================== CLEANUP REPORT [rank=N host=H role=R] =====================
+# and ends with a row of '=' characters. Sets CLEANUP_STATUS/DETAIL just like
+# parse_cleanup_from_log. Used as a fallback when per-rank logs are missing.
+# ---------------------------------------------------------------------------
+parse_cleanup_from_combined_log() {
+    local combined="$1"
+    local rank="$2"
+    CLEANUP_STATUS="UNKNOWN"
+    CLEANUP_DETAIL="no CLEANUP REPORT (combined-log fallback)"
+    [[ -f "${combined}" ]] || { CLEANUP_DETAIL="missing combined log: ${combined}"; return; }
+    local block
+    block=$(awk -v rank="${rank}" '
+        $0 ~ "^=+ CLEANUP REPORT \\[rank="rank" "  { in_block = 1; print; next }
+        in_block && /^=+$/                        { print; exit }
+        in_block                                  { print }
+    ' "${combined}" 2>/dev/null)
+    [[ -z "${block}" ]] && { CLEANUP_DETAIL="no CLEANUP REPORT for rank=${rank} in ${combined}"; return; }
+    local result_line
+    result_line=$(printf '%s\n' "${block}" | grep -E '^cleanup_result:' | head -n 1 || true)
+    [[ -z "${result_line}" ]] && return
+    local delta_line delta
+    delta_line=$(printf '%s\n' "${block}" | grep -E '^gpu_mem_used_mib:' | head -n 1 || true)
+    delta=$(printf '%s' "${delta_line}" | sed -n 's/.*delta=\(-\?[0-9]\+\).*/\1/p')
+    if [[ "${result_line}" == *CLEAN* ]]; then
+        CLEANUP_STATUS="PASS"
+        CLEANUP_DETAIL=$(printf 'delta=%+dMiB(combined)' "${delta:-0}")
+    else
+        CLEANUP_STATUS="FAIL"
+        local detail
+        detail=$(printf '%s' "${result_line}" \
+            | sed -n 's/^cleanup_result:[[:space:]]*DIRTY[[:space:]]*(\(.*\))$/\1/p')
+        CLEANUP_DETAIL="${detail:-DIRTY}(combined)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # parse_cleanup_combined: PASS iff both ranks are CLEAN; FAIL if either is
 # DIRTY; UNKNOWN if either log is missing. Detail string identifies which
-# node failed.
+# node failed. If a per-rank log is missing we fall back to scraping the
+# combined srun log for that rank's CLEANUP REPORT block, so a healthy run
+# isn't false-flagged just because tee couldn't create the per-rank file.
 # ---------------------------------------------------------------------------
 parse_cleanup_combined() {
     local timing="$1"
     local iter="$2"
     local m_status m_detail w_status w_detail
+    local combined_log="${RUN_DIR_HOST}/${timing}__iter${iter}.log"
     rank_log_path "${timing}" "${iter}" 0; local m_log="${RANK_LOG}"
     rank_log_path "${timing}" "${iter}" 1; local w_log="${RANK_LOG}"
-    parse_cleanup_from_log "${m_log}"; m_status="${CLEANUP_STATUS}"; m_detail="${CLEANUP_DETAIL}"
-    parse_cleanup_from_log "${w_log}"; w_status="${CLEANUP_STATUS}"; w_detail="${CLEANUP_DETAIL}"
+    if [[ -f "${m_log}" ]]; then
+        parse_cleanup_from_log "${m_log}"
+    else
+        parse_cleanup_from_combined_log "${combined_log}" 0
+    fi
+    m_status="${CLEANUP_STATUS}"; m_detail="${CLEANUP_DETAIL}"
+    if [[ -f "${w_log}" ]]; then
+        parse_cleanup_from_log "${w_log}"
+    else
+        parse_cleanup_from_combined_log "${combined_log}" 1
+    fi
+    w_status="${CLEANUP_STATUS}"; w_detail="${CLEANUP_DETAIL}"
     if [[ "${m_status}" == "PASS" && "${w_status}" == "PASS" ]]; then
         CLEANUP_STATUS="PASS"
         CLEANUP_DETAIL="m:${m_detail} w:${w_detail}"

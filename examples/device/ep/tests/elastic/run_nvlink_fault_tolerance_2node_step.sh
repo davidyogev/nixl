@@ -49,19 +49,27 @@ SETTLE_SECONDS="${SETTLE_SECONDS:-5}"
 MEM_LEAK_MIB="${MEM_LEAK_MIB:-64}"
 
 # ---------------------------------------------------------------------------
-# 1. Source the canonical container env (PYTHONPATH/LD_LIBRARY_PATH for the
-#    lustre-built nixl_ep tree). Image bakes an older nixl_ep at /usr/local
-#    that shadows ours otherwise.
+# 1. Source the per-clone bring-up script. Defaults to this clone's
+#    setup_node.sh (sourced from /workspace/dyogev/nixl-4165b16) so the
+#    in-kernel-marker bindings built from THIS source are loaded; can be
+#    overridden via FT_SETUP_NODE_SH if a different prebuilt tree is wanted.
+#    Image bakes an older nixl_ep at /usr/local that shadows ours otherwise.
 # ---------------------------------------------------------------------------
-# shellcheck disable=SC1091
-source /workspace/lishapira/setup_node.sh >/dev/null 2>&1 || true
+FT_SETUP_NODE_SH="${FT_SETUP_NODE_SH:-/workspace/dyogev/nixl-4165b16/setup_node.sh}"
+# shellcheck disable=SC1091,SC1090
+source "${FT_SETUP_NODE_SH}" >/dev/null 2>&1 || true
 unset UCX_TLS
 
 # ---------------------------------------------------------------------------
-# 2. Identify our role within this srun step. SLURM_NODEID is 0 on the first
-#    node in the step (== master in our --nodelist ordering), 1 on the second.
+# 2. Identify our role within this run. With the davidyogev-style master-
+#    first/worker-second split, the orchestrator runs two separate
+#    `srun --nodes=1` jobs and SLURM_NODEID is 0 on BOTH of them; the
+#    orchestrator therefore passes FT_NODEID=0 (master) or FT_NODEID=1
+#    (worker) explicitly. Fall back to SLURM_NODEID when FT_NODEID isn't
+#    set so the legacy single-srun-N2 path (and any 1-node call) still
+#    works.
 # ---------------------------------------------------------------------------
-NODEID="${SLURM_NODEID:-0}"
+NODEID="${FT_NODEID:-${SLURM_NODEID:-0}}"
 if (( NODEID == 0 )); then ROLE=master; else ROLE=worker; fi
 SELF_HOST=$(hostname -s)
 
@@ -124,7 +132,17 @@ fi
 #    side), while the lustre file gives the sweep a clean per-rank source.
 # ---------------------------------------------------------------------------
 mkdir -p "${RUN_DIR}"
+chmod 2777 "${RUN_DIR}" 2>/dev/null || true
 RANK_LOG="${RUN_DIR}/${TIMING}__iter${ITER}__rank${NODEID}_${ROLE}_${SELF_HOST}.log"
+# Pre-create the rank log so a permission failure surfaces NOW (in srun's
+# combined log) rather than getting eaten by `tee` inside process substitution.
+# `2>&1 1>&2` so the diagnostic lands on stderr (which propagates) regardless
+# of whether stdout aggregation is healthy.
+if ! : > "${RANK_LOG}" 2>/dev/null; then
+    printf '[step %s/%s] WARN: cannot create rank log %s (perm/uid issue, will fall back to combined log)\n' \
+        "${SELF_HOST}" "${ROLE}" "${RANK_LOG}" >&2
+    RANK_LOG=/dev/null
+fi
 # shellcheck disable=SC2094
 exec > >(tee "${RANK_LOG}") 2>&1
 
@@ -183,8 +201,9 @@ if [[ "${ROLE}" == "worker" ]]; then
     COMMON_ARGS+=(--tcp-server "${MASTER_HOST}")
 fi
 
-cd /workspace/lishapira/nixl/examples/device/ep/tests/elastic
-echo "[step ${SELF_HOST}/${ROLE}] cmd: python3 -u elastic.py ${COMMON_ARGS[*]} $*"
+FT_TEST_DIR="${FT_TEST_DIR:-/workspace/dyogev/nixl-4165b16/examples/device/ep/tests/elastic}"
+cd "${FT_TEST_DIR}"
+echo "[step ${SELF_HOST}/${ROLE}] cmd: python3 -u elastic.py ${COMMON_ARGS[*]} $* (cwd=${FT_TEST_DIR})"
 
 # ---------------------------------------------------------------------------
 # 6. Run elastic.py. SIGKILL on a child rank inside elastic.py is the normal
