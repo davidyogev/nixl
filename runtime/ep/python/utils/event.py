@@ -20,7 +20,7 @@ class EventOverlap:
     ) -> None:
         self.event = event
 
-        # Native events retain EPv2 tensors; this retains caller-supplied tensors.
+        # Native events retain EP tensors; this retains caller-supplied tensors.
         self.extra_tensors = extra_tensors
 
         # A wrapper for `with event_overlap(release_handle=True)`
@@ -49,6 +49,7 @@ class EventOverlap:
         # Keep the original tensor-owning event and the hook completion for later streams.
         if release_handle:
             self.event = self._hook_event = None
+            self.extra_tensors = None
 
     def register_hook_after_wait(self, hook_after_wait: Callable) -> None:
         """Register a one-shot hook after the stream wait."""

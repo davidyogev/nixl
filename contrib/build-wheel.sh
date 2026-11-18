@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --output-dir: Directory to output the wheel to (default: $OUTPUT_DIR)"
             echo "  --ucx-plugins-dir: Directory to find UCX plugins in (default: $UCX_PLUGINS_DIR)"
             echo "  --nixl-plugins-dir: Directory to find NIXL plugins in (default: $NIXL_PLUGINS_DIR)"
-            echo "  --build-nixl-ep: Include NIXL EP v1 and experimental v2 (sm_90 or newer; v2 requires CUDA 13)"
+            echo "  --build-nixl-ep: Include the NIXL EP example and experimental topology-aware runtime (sm_90 or newer; runtime requires CUDA 13)"
             echo "  --torch-versions: Comma-separated list of torch versions to build the wheel for (default: $TORCH_VERSIONS)"
             echo "  --help: Show this help message"
             echo ""
@@ -361,7 +361,7 @@ PY
                 --pattern "nixl_ep_v2_cpp_torch${TORCH_MM}.*" \
                 --target-dir "nixl_cu${CUDA_MAJOR}/runtime/ep"
         else
-            echo "=== NIXL-EP V2 was not built for torch ${TORCH}; skipping merge ==="
+            echo "=== NIXL EP runtime was not built for torch ${TORCH}; skipping merge ==="
         fi
 
         rm -rf "$EP_TMP"

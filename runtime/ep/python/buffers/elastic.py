@@ -36,10 +36,9 @@ class EPHandle:
         num_sms: the active SM count recorded when the handle was created, checked by eager combine. A captured
             dispatch/combine graph reads the current count from the topology descriptor.
         topk_idx: dispatch top-k stable expert IDs, `[num_tokens, num_topk]`; cloned when `do_handle_copy=True`.
-        psum_num_recv_tokens_per_scaleup_rank: inclusive prefix sum of deduplicated received token counts
-            per scaleup rank, shape `[max_num_scaleup_ranks + 1]`. A token is counted once per rank even if
-            multiple of its top-k experts land on the same rank. The last element equals the total number
-            of received tokens.
+        psum_num_recv_tokens_per_scaleup_rank: `[max_num_scaleup_ranks + 1]` inclusive prefix counts
+            over the committed scaleup extent; unused entries before the fixed final total are zero.
+            A token is counted once per rank even if multiple selected experts belong to that rank.
         psum_num_recv_tokens_per_expert: prefix sum of alignment-padded received token counts per local
             expert, shape `[num_experts_per_rank]`. Each expert's count is padded to `expert_alignment`.
             In non-expand mode, this is the inclusive prefix sum. In expand mode, `psum[i]` equals
@@ -257,7 +256,7 @@ class ElasticBuffer:
     positions). `connect_ranks` prepares peers, `set_active_ranks` activates membership, and
     `disconnect_ranks` retires excluded peers. The kernels read the topology descriptor (`EPTopology`).
     Only active ranks launch dispatch/combine. Construction initializes this rank alone.
-    Dispatch/combine and their graph replays require at least two active GPUs; smaller cohorts may bootstrap or tear down.
+    A single active rank can run dispatch/combine before connecting peers, including warm-up and graph capture.
     New-peer connections may run while the committed graph replays. Serialize
     control operations on each buffer; a background setup thread must select the buffer's CUDA device.
     Activation (`set_active_ranks`, `set_num_active_sms`) runs outside capture, between complete dispatch/combine pairs.
@@ -486,7 +485,8 @@ class ElasticBuffer:
         This query does not change the buffer's automatic/manual SM policy.
         The raw estimate may exceed `num_launch_sms`; automatic selection clamps it to that launch limit.
         Traffic uses active domain/position counts and their fixed physical slots. One active domain
-        has no RDMA traffic even above domain index 0. Fewer active experts than `num_topk` requires explicit `num_sms`.
+        has no RDMA traffic even above domain index 0. With multiple active ranks, fewer active experts than
+        `num_topk` requires explicit `num_sms`.
         Every active rank's `dispatch(num_sms=0)` commits the same active SM count.
 
         Arguments:
@@ -528,7 +528,7 @@ class ElasticBuffer:
         # Holes occupy routing IDs but generate no traffic; estimate only the active ranks' physical slots.
         num_active_experts = self.num_experts_per_rank * num_active_ranks
         assert (
-            num_active_experts >= num_topk
+            num_active_ranks == 1 or num_active_experts >= num_topk
         ), f"the active ranks own {num_active_experts} physical slots, fewer than num_topk={num_topk}: the traffic model has no estimate, pass num_sms"
         return self._get_theoretical_num_sms(
             num_active_experts,
@@ -584,7 +584,9 @@ class ElasticBuffer:
             else 0
         )
 
-        num_expected_topk = get_expected_topk(num_active_ranks)
+        num_expected_topk = (
+            get_expected_topk(num_active_ranks) if num_active_ranks > 1 else 1
+        )
 
         # Read tokens
         sm_read += 1 / num_expected_topk
@@ -744,11 +746,9 @@ class ElasticBuffer:
         auto_sm_config = None if num_active_sms else self._auto_sm_config
         if not num_active_sms:
             num_active_sms = self._get_topology()[1]
-            # Inactive ranks and bootstrap/teardown worlds do not launch dispatch/combine.
+            # Only active ranks launch dispatch/combine.
             if (
                 auto_sm_config is not None
-                and bin(scaleout_mask).count("1") * bin(scaleup_mask).count("1")
-                >= _C.min_num_active_ranks
                 and scaleout_mask & (1 << self.scaleout_rank_idx)
                 and scaleup_mask & (1 << self.scaleup_rank_idx)
             ):
@@ -1068,8 +1068,8 @@ class ElasticBuffer:
         self,
         x: torch.Tensor,
         handle: EPHandle,
-        bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-        previous_event: EventHandle = None,
+        bias: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        previous_event: Optional[EventHandle] = None,
         previous_event_before_epilogue: Optional[EventHandle] = None,
         async_with_compute_stream: bool = False,
         allocate_on_comm_stream: bool = False,
