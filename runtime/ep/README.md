@@ -276,17 +276,23 @@ not per-NIC bandwidth measurements. `--dtype` selects BF16, FP8 or NVFP4
 dispatch for checked and timed pairs, with matching buffer capacity.
 Payload values and scales are checked byte for byte; combine stays BF16.
 
-Each phase checks eager execution and retained CUDA graphs with both original
-and changed routing. Processes remain alive throughout the membership plan;
-the active topology determines direct or hybrid execution.
-`--reconnect-on-leave` retires departing ranks' peer connections into local
-singleton buffers that sit out until rejoining; their captured graphs are retained.
-Custom reconnect plans must form a product of domains and positions after each
-reconnection. Ranks in a fully retired domain may receive positions incompatible
-with those retained in another domain. The default plan avoids this by restoring
-the full cohort between shrinks; custom plans can do the same or keep connections.
-Unsupported plans fail the normal activation check; the test neither rewrites
-them nor treats rejection as a passing result.
+With an explicit plan, a CPU supervisor on each node starts GPU processes as
+their ranks join. For example, `--plan '[[0,1],[0,1,2,3],[0,1]]'` starts only
+ranks 0 and 1, captures their CUDA graphs, then starts 2 and 3. Ranks 0 and 1
+replay those same graphs after expansion and again after 2 and 3 destroy their
+buffers and exit. Each phase checks eager execution and replay with both the
+original routing and routing for the new membership. A returning rank starts
+a fresh process. Each membership must form a product of domains and positions.
+
+If phase 0 spans the allocation, its workers discover the physical domain
+sizes. For a partial start, the test reserves capacity without probing future
+GPUs. Specify `--ranks-per-domain` for a domain spanning nodes or for a
+partially occupied domain. The default is the GPUs per node, capped at
+`--max-scaleup-ranks` when supplied. The runtime discovers actual peer connectivity.
+
+The built-in plan keeps GPU processes alive and exercises membership changes
+on resident buffers. Use `--reconnect-on-leave` with that plan to retire and
+reconnect peers while retaining the idle ranks' graphs.
 
 ## Phase profiling
 

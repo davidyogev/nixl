@@ -8,8 +8,8 @@ Test elastic membership of adaptive EP kernels over NIXL (RDMA and NVLink).
 The host derives each phase's kernel mode from the active topology: direct when
 exactly one NVLink domain is active, hybrid when multiple domains are active.
 A plan scales membership up and down through lists of public world ranks; their
-discovered slots must form a product of NVLink domains and positions. All job
-processes stay alive, and participating ranks activate each phase.
+discovered slots must form a product of NVLink domains and positions. Explicit
+plans launch and retire GPU processes as the membership changes.
 
 Each active rank checks eager dispatch/combine and retained CUDA-graph replay.
 The test also exercises buffer setup, peer connections, membership updates and
@@ -20,17 +20,8 @@ import json
 import os
 import tempfile
 from datetime import timedelta
-from typing import (
-    Callable,
-    Dict,
-    List,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-    cast,
-)
+from itertools import count
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -81,9 +72,7 @@ def make_buffer(
     max_su = placement.pop("max_num_scaleup_ranks", 0) or positions
     world = placement.pop("world_ranks", None)
     if world is None:
-        world = [
-            (rank // positions) * max_su + rank % positions for rank in range(num_ranks)
-        ]
+        world = fixture_ranks(num_ranks, positions, max_su, args.position_offset)
     assert len(world) == num_ranks and len(set(world)) == num_ranks
     max_ranks = max_so * max_su
     assert args.num_experts > 0 and args.num_experts % max_ranks == 0
@@ -113,6 +102,69 @@ def make_buffer(
         )
         buffer.set_active_ranks(world)
     return buffer
+
+
+def fixture_ranks(size, width, max_su, offset):
+    if width <= 0 or size % width or offset < 0 or offset + width > max_su:
+        raise ValueError(
+            "Fixture ranks must fill equal domains and fit within --max-scaleup-ranks"
+        )
+    return [(r // width) * max_su + offset + r % width for r in range(size)]
+
+
+def process_placement(args, plan, size):
+    if (
+        not isinstance(plan, list)
+        or not plan
+        or any(
+            not isinstance(phase, list)
+            or not phase
+            or any(type(rank) is not int or rank < 0 for rank in phase)
+            or len(set(phase)) != len(phase)
+            for phase in plan
+        )
+    ):
+        raise ValueError(
+            "Each phase must name a nonempty list of distinct nonnegative rank IDs"
+        )
+    if not args.ranks_per_domain and len(plan[0]) == size:
+        # The whole allocation is already required in phase zero. Its live workers can discover the fixture.
+        world, max_so, max_su = sorted(plan[0]), 0, 0
+    else:
+        # Future GPUs need not exist yet. Reserve capacity from the declared fixture.
+        width = args.ranks_per_domain or min(
+            args.num_processes, args.max_scaleup_ranks or args.num_processes
+        )
+        max_su = args.max_scaleup_ranks or width
+        world = fixture_ranks(size, width, max_su, args.position_offset)
+        max_so = size // width
+    missing = set().union(*plan) - set(world)
+    if missing:
+        raise ValueError(
+            f"Plan names ranks {sorted(missing)} outside {world}; check --ranks-per-domain and --position-offset"
+        )
+    return world, max_so, max_su
+
+
+def resolve_initial_geometry(store, plan, world_rank, start_phase, args):
+    if start_phase == 0:
+        world = sorted(plan[0])
+        cohort = NixlBootstrap(
+            store,
+            world.index(world_rank),
+            len(world),
+            world_ranks=world,
+            timeout_seconds=args.store_timeout_secs,
+        )
+        width = cohort.num_scaleup_ranks
+        max_su = args.max_scaleup_ranks or width
+        if world != fixture_ranks(len(world), width, max_su, args.position_offset):
+            raise ValueError(
+                "Initial phase IDs do not match the discovered fixture and --position-offset"
+            )
+        if world_rank == world[0]:
+            store.set("geometry", json.dumps([len(world) // width, max_su]))
+    return json.loads(store.get("geometry"))
 
 
 def extent_of(phase: Sequence[int], max_su: int, mapping=None) -> Tuple[int, int]:
@@ -918,6 +970,23 @@ def run_perf(
     return record
 
 
+def write_results(path, config, plan, ranks):
+    with tempfile.TemporaryDirectory(
+        dir=os.path.dirname(os.path.abspath(path))
+    ) as directory:
+        temporary_path = os.path.join(directory, "results.json")
+        with open(temporary_path, "w") as output:
+            json.dump(
+                dict(schema_version=2, config=config, plan=plan, ranks=ranks),
+                output,
+                indent=2,
+                allow_nan=False,
+            )
+            output.write("\n")
+        os.replace(temporary_path, path)
+    print(f"Results saved to {path}", flush=True)
+
+
 def save_results(
     cohort: NixlBootstrap, path: str, config: dict, plan: List[List[int]], records: dict
 ) -> Optional[str]:
@@ -925,20 +994,7 @@ def save_results(
     error = None
     if cohort.rank == 0:
         try:
-            with tempfile.TemporaryDirectory(
-                dir=os.path.dirname(os.path.abspath(path))
-            ) as directory:
-                temporary_path = os.path.join(directory, "results.json")
-                with open(temporary_path, "w") as output:
-                    json.dump(
-                        dict(schema_version=2, config=config, plan=plan, ranks=ranks),
-                        output,
-                        indent=2,
-                        allow_nan=False,
-                    )
-                    output.write("\n")
-                os.replace(temporary_path, path)
-            print(f"Results saved to {path}", flush=True)
+            write_results(path, config, plan, ranks)
         except (OSError, TypeError, ValueError) as exc:
             error = f"Failed to save results to {path}: {type(exc).__name__}: {exc}"
     return cohort._all_gather("results-written", error)[0]
@@ -1003,10 +1059,6 @@ class PairCase:
         self.case.buffer.combine(**self.combine_args)
 
 
-# The barriers `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
-NUM_CAPTURE_BARRIERS = 3
-
-
 def capture(forward, barrier=dist.barrier, do_capture=True):
     # Warm up eagerly (JIT compile, first-touch allocations), then capture one graph.
     # `do_capture=False` runs the same warm-ups and barriers without capturing
@@ -1047,7 +1099,7 @@ class GraphCase:
         self.case = case
         # The phase whose routing each rank captured; warmup may use a smaller active world.
         self.capture_phase_of = capture_phase_of
-        # Whole-job barrier, including idle ranks.
+        # The caller supplies the barrier for this capture group.
         self.barrier = barrier_fn
         me = case.buffer.world_rank
         self.topk_idx, self.topk_weights = case.routing(
@@ -1100,12 +1152,8 @@ class GraphCase:
         combined_x, _ = case.buffer.combine(x=y, handle=handle)
         return combined_x, handle, recv_x, recv_topk_idx, recv_topk_weights
 
-    # The barriers the shared `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
-    NUM_CAPTURE_BARRIERS = NUM_CAPTURE_BARRIERS
-
     def capture(self, accompany: bool = False):
-        # The capture protocol over this rank's barrier; the other active ranks run it in
-        # lockstep (`accompany`: warm-ups and barriers only, for a rank that has its graph), idle ranks mirror the barriers
+        # Survivors join a newcomer's collective warm-ups while keeping their original graph and outputs.
         graph, outputs = capture(self.forward, self.barrier, do_capture=not accompany)
         if not accompany:
             self.graph = graph
@@ -1313,6 +1361,164 @@ def run_api_cases(case: Case, present: List[int]) -> None:
         run_eager(case, 0, present, f"{tag} {mode}", mode, check_expanded=True)
 
 
+def run_checked_phase(case, phase_idx, phase, graph, perf_phases):
+    args, buffer = case.args, case.buffer
+    me, active_mode = buffer.world_rank, buffer._get_mode()
+    so_extent, su_extent = case.extent(phase)
+    tag = f"rank {me} {active_mode} phase {phase_idx} {phase} (extent {so_extent}x{su_extent})"
+    if args.profile:
+        buffer.read_profile()  # Discard warm-up or prior-phase samples before this isolated pair.
+    num_recv = run_eager(case, phase_idx, phase, tag)
+    if args.profile:
+        print_profile(buffer, phase_idx, "eager")
+    num_recv_graph = graph.replay_and_check(phase, tag)
+    if args.profile:
+        print_profile(buffer, phase_idx, "graph")
+    num_recv_rerouted = graph.replay_and_check(
+        phase,
+        tag,
+        routing_phase_idx=GraphCase.REROUTE_ROUTING_PHASE + phase_idx,
+    )
+    if args.profile:
+        print_profile(buffer, phase_idx, "graph-rerouted")
+    # One line per phase from the lowest active rank (local rank 0 may sit the phase out)
+    if me == min(phase):
+        print(
+            f" > [{tag}] eager: {num_recv} tokens received, bitwise match; "
+            f"graph replay (captured at phase {graph.capture_phase_of[me]}): {num_recv_graph} tokens received; "
+            f"rerouted: {num_recv_rerouted} tokens received, bitwise match",
+            flush=True,
+        )
+    measure_events, measure_kernels = benchmark_options(args, phase_idx, perf_phases)
+    performance = (
+        run_perf(
+            case,
+            phase_idx,
+            phase,
+            active_mode,
+            args,
+            measure_events=measure_events,
+            measure_kernels=measure_kernels,
+        )
+        if measure_events or measure_kernels
+        else None
+    )
+    return dict(
+        phase=phase_idx,
+        ranks=phase,
+        mode=active_mode,
+        extent=[so_extent, su_extent],
+        eager_num_recv=num_recv,
+        graph_num_recv=num_recv_graph,
+        graph_rerouted_num_recv=num_recv_rerouted,
+        performance=performance,
+    )
+
+
+def phase_barrier(store, phase_idx, ranks, world_rank, timeout):
+    rounds = count()
+
+    def barrier():
+        torch.cuda.synchronize()
+        prefix = f"phase/{phase_idx}/barrier/{next(rounds)}"
+        store.set(f"{prefix}/{world_rank}", b"1")
+        store.wait([f"{prefix}/{rank}" for rank in ranks], timeout)
+
+    return barrier
+
+
+@torch.inference_mode()
+def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
+    init_test_environment(local_rank, args.num_processes, args.seed)
+    timeout = timedelta(seconds=args.store_timeout_secs)
+    store = dist.TCPStore(
+        os.getenv("SERVER_ADDR", "127.0.0.1"),
+        int(os.getenv("SERVER_PORT", "8361")),
+        world_size=None,
+        is_master=False,
+        timeout=timeout,
+    )
+    if max_so == max_su == 0:
+        max_so, max_su = resolve_initial_geometry(
+            store, plan, world_rank, start_phase, args
+        )
+    buffer = make_buffer(
+        args,
+        0,
+        1,
+        store,
+        world_ranks=[world_rank],
+        max_num_scaleout_ranks=max_so,
+        max_num_scaleup_ranks=max_su,
+        deterministic=False,
+    )
+    case = Case(buffer, args)
+    graph = None
+    capture_phase_of = {}
+    perf_phases = {int(p) for p in args.perf_phases.split(",") if p.strip()}
+
+    for phase_idx, phase in enumerate(plan):
+        # Rejoining ranks have new processes and capture again. A later joiner
+        # derives the current incumbents' original routing from the same plan.
+        members = set(phase)
+        joining = members - capture_phase_of.keys()
+        capture_phase_of = {r: capture_phase_of.get(r, phase) for r in phase}
+        if phase_idx < start_phase:
+            continue
+
+        store.wait([f"phase/{phase_idx}/start"], timeout)
+        barrier = phase_barrier(store, phase_idx, phase, world_rank, timeout)
+        peers = sorted(members - {world_rank})
+        buffer.connect_ranks(
+            peers,
+            key_prefix=f"phase/{phase_idx}/peers",
+            timeout_secs=args.store_timeout_secs,
+        )
+        barrier()
+        buffer.set_active_ranks(phase)
+        barrier()
+        assert sorted(buffer.get_connected_ranks()) == peers
+        assert buffer.get_active_ranks() == sorted(phase)
+        assert buffer._get_mode() == expected_mode(phase, max_su, rank_mapping(buffer))
+
+        if phase_idx == 0:
+            run_api_cases(case, phase)
+        if graph is None:
+            graph = GraphCase(case, phase, capture_phase_of, barrier)
+            graph.capture()
+        else:
+            graph.capture_phase_of = capture_phase_of
+            graph.barrier = barrier
+            if joining:
+                graph.capture(accompany=True)
+        record = run_checked_phase(case, phase_idx, phase, graph, perf_phases)
+
+        next_members = set(plan[phase_idx + 1]) if phase_idx + 1 < len(plan) else set()
+        leaving = members - next_members
+        buffer.barrier(with_cpu_sync=True)
+        barrier()
+        if leaving:
+            survivors = members - leaving
+            if survivors and next_members - members:
+                # The overlap of two phases with replacements need not itself be
+                # a valid topology. Park each drained rank on its own GPU.
+                buffer.set_active_ranks([world_rank])
+                barrier()
+            retiring = peers if world_rank in leaving else sorted(leaving)
+            buffer.disconnect_ranks(retiring)
+            assert set(buffer.get_connected_ranks()) == set(peers) - set(retiring)
+        barrier()
+        if world_rank in leaving:
+            graph.release()
+            buffer.destroy()
+        store.set(
+            f"phase/{phase_idx}/complete/{world_rank}",
+            json.dumps(record) if args.save_output else b"1",
+        )
+        if world_rank in leaving:
+            return
+
+
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks = init_test_environment(local_rank, num_local_ranks, args.seed)
@@ -1342,19 +1548,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             print(message, flush=True)
         barrier()
 
-    # Public fixture IDs may include holes; hardware discovery determines their coordinates.
-    placement = {}
-    if args.position_offset:
-        group_su = cohort.num_scaleup_ranks
-        placement = dict(
-            world_ranks=[
-                (rank // group_su) * args.max_scaleup_ranks
-                + args.position_offset
-                + rank % group_su
-                for rank in range(num_ranks)
-            ]
-        )
-
     buffer = make_buffer(
         args,
         rank_idx,
@@ -1363,7 +1556,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_group_scaleup_ranks=cohort.num_scaleup_ranks,
         max_num_scaleup_ranks=args.max_scaleup_ranks,
         deterministic=True,
-        **placement,
     )
     max_so, max_su = buffer.max_num_scaleout_ranks, buffer.max_num_scaleup_ranks
     mode = buffer._get_mode()
@@ -1373,11 +1565,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert mode == expected_mode(
         present, max_su, rank_mapping(buffer)
     ), f"setup derived {mode} for {present}"
-    plan = (
-        load_plan(args.plan)
-        if args.plan
-        else default_plan(max_su, present, rank_mapping(buffer))
-    )
+    plan = default_plan(max_su, present, rank_mapping(buffer))
     cohort_print(
         f"Elastic test: world {max_so}x{max_su}, world rank {buffer.world_rank}, internal coordinates {rank_coordinates(buffer)}, "
         f"initial mode {mode}, launch grid {buffer.num_launch_sms}, "
@@ -1386,7 +1574,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     case = Case(buffer, args)
     validate_plan(case, plan, present)
-    profile = getattr(args, "profile", False)
 
     me = buffer.world_rank
     # Phases whose active ranks get benchmark timings, e.g. the phase a world grew or shrank into
@@ -1400,11 +1587,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     run_api_cases(case, present)
     cohort_print(f"API combinations passed ({case.dtype})")
 
-    # The phase each rank captures its graph at: the first phase of the plan it takes part in (reversed: the first wins)
-    capture_phase_of = {r: list(phase) for phase in reversed(plan) for r in phase}
-
-    graph: Optional[GraphCase] = None
-    captured: set[int] = set()
+    graph = GraphCase(case, present, {rank: present for rank in present}, barrier)
     for phase_idx, phase in enumerate(plan):
         switch_world(
             buffer,
@@ -1413,81 +1596,14 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.store_timeout_secs,
             args.reconnect_on_leave,
         )
-        active = me in phase
-        active_mode = buffer._get_mode() if active else None
-
-        # Ranks active for the first time capture now; the other active ranks run the warm-ups with them, idle ranks mirror the barriers
-        new_capturers = sorted(set(phase) - captured)
-        if me in new_capturers:
-            graph = GraphCase(case, phase, capture_phase_of, barrier)
+        if phase_idx == 0:
             graph.capture()
-        elif new_capturers and active:
-            assert graph is not None
-            graph.capture(accompany=True)
-        elif new_capturers:
-            for _ in range(GraphCase.NUM_CAPTURE_BARRIERS):
-                barrier()
-        captured |= set(new_capturers)
-
-        if active:
-            so_extent, su_extent = case.extent(phase)
-            tag = f"rank {me} {active_mode} phase {phase_idx} {phase} (extent {so_extent}x{su_extent})"
-            assert graph is not None
-            if profile:
-                buffer.read_profile()  # Discard warm-up or prior-phase samples before this isolated pair.
-            num_recv = run_eager(case, phase_idx, phase, tag)
-            if profile:
-                print_profile(buffer, phase_idx, "eager")
-            num_recv_graph = graph.replay_and_check(phase, tag)
-            if profile:
-                print_profile(buffer, phase_idx, "graph")
-            num_recv_rerouted = graph.replay_and_check(
-                phase,
-                tag,
-                routing_phase_idx=GraphCase.REROUTE_ROUTING_PHASE + phase_idx,
-            )
-            if profile:
-                print_profile(buffer, phase_idx, "graph-rerouted")
-            # One line per phase from the lowest active rank (local rank 0 may sit the phase out)
-            if me == min(phase):
-                print(
-                    f" > [{tag}] eager: {num_recv} tokens received, bitwise match; "
-                    f"graph replay (captured at phase {graph.capture_phase_of[me]}): {num_recv_graph} tokens received; "
-                    f"rerouted: {num_recv_rerouted} tokens received, bitwise match",
-                    flush=True,
-                )
-            measure_events, measure_kernels = benchmark_options(
-                args, phase_idx, perf_phases
-            )
-            performance = (
-                run_perf(
-                    case,
-                    phase_idx,
-                    phase,
-                    cast(str, active_mode),
-                    args,
-                    measure_events=measure_events,
-                    measure_kernels=measure_kernels,
-                )
-                if measure_events or measure_kernels
-                else None
-            )
+        if me in phase:
+            record = run_checked_phase(case, phase_idx, phase, graph, perf_phases)
             if args.save_output:
-                phase_records.append(
-                    dict(
-                        phase=phase_idx,
-                        ranks=phase,
-                        mode=active_mode,
-                        extent=[so_extent, su_extent],
-                        eager_num_recv=num_recv,
-                        graph_num_recv=num_recv_graph,
-                        graph_rerouted_num_recv=num_recv_rerouted,
-                        performance=performance,
-                    )
-                )
+                phase_records.append(record)
         barrier()
-    if graph is not None:
-        graph.release()
+    graph.release()
 
     # Back to the full world (the host derives its mode) before tearing down
     switch_world(
@@ -1622,11 +1738,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reconnect-on-leave",
         action="store_true",
-        help="retire all peers while a rank sits out; reconnect may reassign internal "
+        help="in the built-in plan, retire all peers while a rank sits out; reconnect may reassign internal "
         "positions, so each phase must remain a product of domains and positions "
         "(default: keep connections)",
     )
     parser.add_argument("--num-cpu-timeout-secs", type=int, default=100)
+    parser.add_argument(
+        "--ranks-per-domain",
+        type=int,
+        default=0,
+        help="GPUs per physical NVLink domain in an explicit plan's allocation; "
+        "use for partial initial groups when the domain spans nodes or has unused slots",
+    )
     parser.add_argument(
         "--max-scaleup-ranks",
         type=int,
@@ -1647,6 +1770,26 @@ if __name__ == "__main__":
     assert (
         args.position_offset == 0 or args.max_scaleup_ranks > 0
     ), "--position-offset needs --max-scaleup-ranks"
-    torch.multiprocessing.spawn(
-        test_loop, args=(args.num_processes, args), nprocs=args.num_processes
-    )
+    if args.plan:
+        from process_plan import run_process_plan
+
+        plan = load_plan(args.plan)
+        size = int(os.getenv("WORLD_SIZE", 1)) * args.num_processes
+        if args.num_processes < 1 or size < 1:
+            parser.error("The test needs at least one node and one GPU per node")
+        world, max_so, max_su = process_placement(args, plan, size)
+        if any(
+            not 0 <= int(p) < len(plan)
+            for p in args.perf_phases.split(",")
+            if p.strip()
+        ):
+            parser.error("--perf-phases names a phase outside the plan")
+        run_process_plan(args, plan, world, max_so, max_su, run_worker, write_results)
+    else:
+        if args.ranks_per_domain:
+            parser.error(
+                "--ranks-per-domain describes the allocation for an explicit --plan"
+            )
+        torch.multiprocessing.spawn(
+            test_loop, args=(args.num_processes, args), nprocs=args.num_processes
+        )
