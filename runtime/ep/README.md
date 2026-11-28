@@ -290,6 +290,27 @@ GPUs. Specify `--ranks-per-domain` for a domain spanning nodes or for a
 partially occupied domain. The default is the GPUs per node, capped at
 `--max-scaleup-ranks` when supplied. The runtime discovers actual peer connectivity.
 
+To test replacement on another host, run the same membership plan on three
+launchers. Set `SERVER_ADDR` to host A's reachable address on each. For the
+commands below, define the same shell array on each host:
+
+```bash
+test_ep=(python tests/elastic/test_elastic_ep.py --plan '[[0,1,2,3],[0,1],[0,1,2,3]]'
+         --num-processes 2 --max-scaleout-ranks 2 --max-scaleup-ranks 4
+         --num-tokens 16 --num-experts 16 --num-topk 8 --dtype bf16)
+```
+
+1. On A, run `RANK=0 "${test_ep[@]}" --worker-ranks 0,1 --save-output results.json`.
+2. On B, run `RANK=1 "${test_ep[@]}" --worker-ranks 2,3`. This launcher exits after shrink.
+3. After B exits and A reports its two-rank replay, run
+   `RANK=1 "${test_ep[@]}" --worker-ranks 2,3 --join-phase 2 --expect-new-host` on C.
+
+Each launcher assigns its listed world ranks to local GPUs in order. Only A
+hosts the Store. C can come online for the last phase. Its workers check that
+their host boot IDs and GPU UUIDs changed and that their new buffers received
+tokens from survivors replaying their original graphs. The two maximum
+dimensions reserve capacity for either one four-GPU domain or two two-GPU domains.
+
 The built-in plan keeps GPU processes alive and exercises membership changes
 on resident buffers. Use `--reconnect-on-leave` with that plan to retire and
 reconnect peers while retaining the idle ranks' graphs.

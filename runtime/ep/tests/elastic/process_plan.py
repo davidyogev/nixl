@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Launch and reap the GPU workers of an elastic test plan, one supervisor per node."""
+"""Launch and reap the GPU workers of an elastic test plan."""
 
 import json
 import multiprocessing
@@ -15,15 +15,24 @@ import torch.distributed as dist
 
 def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_results):
     node = int(os.getenv("RANK", "0"))
-    nodes = int(os.getenv("WORLD_SIZE", "1"))
-    assert 0 <= node < nodes and len(world_ranks) == nodes * args.num_processes
-    participating = set().union(*plan)
-    owners = {
-        index // args.num_processes
-        for index, rank in enumerate(world_ranks)
-        if rank in participating
-    }
-    if node and node not in owners:
+    local = args.worker_ranks
+    if local is None:
+        local = world_ranks[node * args.num_processes : (node + 1) * args.num_processes]
+    else:
+        if not 0 <= args.join_phase < len(plan):
+            raise ValueError("--join-phase is outside the plan")
+        previous = plan[args.join_phase - 1] if args.join_phase else ()
+        joining = set(plan[args.join_phase]).difference(previous)
+        if not (
+            0 < len(local) <= args.num_processes
+            and len(set(local)) == len(local)
+            and set(local) <= joining
+        ):
+            raise ValueError(
+                "--worker-ranks must name distinct ranks joining at --join-phase, "
+                "one per local GPU"
+            )
+    if node and not any(set(local).intersection(phase) for phase in plan):
         return
 
     # The CPU supervisor owns the server even when GPU rank zero is absent.
@@ -36,10 +45,9 @@ def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_resu
         wait_for_workers=False,
     )
     spawn = multiprocessing.get_context("spawn")
-    local = world_ranks[node * args.num_processes : (node + 1) * args.num_processes]
     children = {}
 
-    def wait_for(keys):
+    def wait_for(keys=()):
         # Poll the children as well as the Store so a failed worker wakes the
         # other supervisors even when its peers are blocked inside a collective.
         deadline = time.monotonic() + args.store_timeout_secs
@@ -65,22 +73,35 @@ def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_resu
                     flush=True,
                 )
                 store.set(f"phase/{last_phase}/exit/{rank}", "1")
-            if not keys or store.check(keys):
+            if (keys and store.check(keys)) or (not keys and not children):
                 return
-            if time.monotonic() >= deadline:
+            # A client waiting for its next launch or last child can span many
+            # phases. The coordinator enforces a separate deadline per phase.
+            if node == 0 and time.monotonic() >= deadline:
                 missing = [key for key in keys if not store.check([key])]
                 raise TimeoutError(f"Node {node} timed out waiting for {missing}")
             time.sleep(0.05)
 
     try:
         for i, phase in enumerate(plan):
+            previous = plan[i - 1] if i else ()
+            starts = [
+                (ordinal, rank)
+                for ordinal, rank in enumerate(local)
+                if rank in phase
+                and rank not in previous
+                and (args.worker_ranks is None or i == args.join_phase)
+            ]
             if node == 0:
                 store.set(f"phase/{i}/start", "1")
+            elif not starts:
+                continue
             wait_for([f"phase/{i}/start"])
-            previous = plan[i - 1] if i else ()
-            for local_rank, rank in enumerate(local):
-                if rank not in phase or rank in previous:
-                    continue
+            for local_rank, rank in starts:
+                if store.add(f"phase/{i}/owner/{rank}", 1) != 1:
+                    raise ValueError(
+                        f"Multiple launchers claimed rank {rank} in phase {i}"
+                    )
                 # A worker serves one contiguous run of phases on the same GPU.
                 last_phase = i
                 while last_phase + 1 < len(plan) and rank in plan[last_phase + 1]:
@@ -127,12 +148,11 @@ def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_resu
                     plan,
                     ranks,
                 )
-            store.set("finished", "1")
-            wait_for([f"finished/{owner}" for owner in sorted(owners) if owner != 0])
             print("Adaptive elastic test passed", flush=True)
         else:
-            wait_for(["finished"])
-            store.set(f"finished/{node}", "1")
+            # The final exit record is our last Store operation. The coordinator
+            # can close the Store as soon as all GPU processes have been reaped.
+            wait_for()
     except BaseException as exc:
         # Preserve the first failure, including a local worker's exit status.
         try:

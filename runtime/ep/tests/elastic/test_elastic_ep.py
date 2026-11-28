@@ -21,6 +21,7 @@ import os
 import tempfile
 from datetime import timedelta
 from itertools import count
+from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
@@ -36,27 +37,14 @@ from nixl.runtime.ep.utils.refs import generate_pre_combine_data, ordered_accumu
 from nixl.runtime.ep.utils.testing import bench, bench_kineto
 
 
-def init_test_environment(
-    local_rank: int, num_local_ranks: int, seed: int
-) -> Tuple[int, int]:
-    """Use node-level `WORLD_SIZE`/`RANK` without a process group: this process's index in the
-    cohort of every invocation and the cohort size; selects the GPU and seeds per rank.
-    """
-    num_nodes, node_rank = int(os.getenv("WORLD_SIZE", 1)), int(os.getenv("RANK", 0))
-    assert num_nodes > 0 and 0 <= node_rank < num_nodes
-    assert 0 <= local_rank < num_local_ranks
+def init_test_environment(local_rank: int, world_rank: int, seed: int) -> None:
     assert (
         not dist.is_initialized()
     ), "This test uses a standalone Store, not a process group"
-    rank_idx, num_ranks = (
-        node_rank * num_local_ranks + local_rank,
-        num_nodes * num_local_ranks,
-    )
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
-    torch.manual_seed(seed + rank_idx)
-    return rank_idx, num_ranks
+    torch.manual_seed(seed + world_rank)
 
 
 def make_buffer(
@@ -127,6 +115,15 @@ def process_placement(args, plan, size):
         raise ValueError(
             "Each phase must name a nonempty list of distinct nonnegative rank IDs"
         )
+    if size is None:
+        world = sorted(set().union(*plan))
+        max_so, max_su = args.max_scaleout_ranks, args.max_scaleup_ranks
+        if max_so <= 0 or max_su <= 0 or world[-1] >= max_so * max_su:
+            raise ValueError(
+                "With --worker-ranks, set --max-scaleout-ranks and --max-scaleup-ranks "
+                "to capacities covering every world rank"
+            )
+        return world, max_so, max_su
     if not args.ranks_per_domain and len(plan[0]) == size:
         # The whole allocation is already required in phase zero. Its live workers can discover the fixture.
         world, max_so, max_su = sorted(plan[0]), 0, 0
@@ -1427,9 +1424,28 @@ def phase_barrier(store, phase_idx, ranks, world_rank, timeout):
     return barrier
 
 
+def worker_location(local_rank):
+    return dict(
+        host_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        gpu_uuid=str(torch.cuda.get_device_properties(local_rank).uuid),
+        pid=os.getpid(),
+    )
+
+
+def check_replacement_traffic(case, graph, phase, survivors, num_recv):
+    sources = (
+        graph.handle.recv_src_metadata[:num_recv, 0] // case.num_max_tokens_per_rank
+    )
+    retained = {case.flat_idx(rank, phase) for rank in survivors}
+    assert retained.intersection(sources.tolist()), (
+        f"Replacement rank {case.buffer.world_rank} received no graph traffic "
+        f"from surviving ranks {sorted(survivors)}"
+    )
+
+
 @torch.inference_mode()
 def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
-    init_test_environment(local_rank, args.num_processes, args.seed)
+    init_test_environment(local_rank, world_rank, args.seed)
     timeout = timedelta(seconds=args.store_timeout_secs)
     store = dist.TCPStore(
         os.getenv("SERVER_ADDR", "127.0.0.1"),
@@ -1438,6 +1454,18 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
         is_master=False,
         timeout=timeout,
     )
+    if args.worker_ranks is not None:
+        location = worker_location(local_rank)
+        key = f"last-location/{world_rank}"
+        if args.expect_new_host:
+            if not store.check([key]):
+                raise ValueError(f"Rank {world_rank} has no previous worker to replace")
+            previous = json.loads(store.get(key))
+            for field in ("host_id", "gpu_uuid"):
+                assert (
+                    previous[field] != location[field]
+                ), f"Replacement rank {world_rank} reused {field} {location[field]}"
+        store.set(key, json.dumps(location))
     if max_so == max_su == 0:
         max_so, max_su = resolve_initial_geometry(
             store, plan, world_rank, start_phase, args
@@ -1469,13 +1497,14 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
         store.wait([f"phase/{phase_idx}/start"], timeout)
         barrier = phase_barrier(store, phase_idx, phase, world_rank, timeout)
         peers = sorted(members - {world_rank})
-        buffer.connect_ranks(
-            peers,
-            key_prefix=f"phase/{phase_idx}/peers",
-            timeout_secs=args.store_timeout_secs,
-        )
-        barrier()
-        buffer.set_active_ranks(phase)
+        if joining:
+            buffer.connect_ranks(
+                peers,
+                key_prefix=f"phase/{phase_idx}/peers",
+                timeout_secs=args.store_timeout_secs,
+            )
+            barrier()
+            buffer.set_active_ranks(phase)
         barrier()
         assert sorted(buffer.get_connected_ranks()) == peers
         assert buffer.get_active_ranks() == sorted(phase)
@@ -1486,12 +1515,26 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
         if graph is None:
             graph = GraphCase(case, phase, capture_phase_of, barrier)
             graph.capture()
+            initial_graph = graph.graph
         else:
             graph.capture_phase_of = capture_phase_of
             graph.barrier = barrier
             if joining:
                 graph.capture(accompany=True)
+        assert graph.graph is initial_graph, f"Rank {world_rank} recaptured its graph"
         record = run_checked_phase(case, phase_idx, phase, graph, perf_phases)
+        if args.worker_ranks is not None:
+            record.update(
+                location, graph_capture_phase=start_phase, graph_id=id(graph.graph)
+            )
+            if args.expect_new_host and phase_idx == start_phase:
+                check_replacement_traffic(
+                    case,
+                    graph,
+                    phase,
+                    members - joining,
+                    record["graph_rerouted_num_recv"],
+                )
 
         next_members = set(plan[phase_idx + 1]) if phase_idx + 1 < len(plan) else set()
         leaving = members - next_members
@@ -1509,11 +1552,16 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
             assert set(buffer.get_connected_ranks()) == set(peers) - set(retiring)
         barrier()
         if world_rank in leaving:
+            del initial_graph
             graph.release()
             buffer.destroy()
         store.set(
             f"phase/{phase_idx}/complete/{world_rank}",
-            json.dumps(record) if args.save_output else b"1",
+            (
+                json.dumps(record)
+                if args.save_output or args.worker_ranks is not None
+                else b"1"
+            ),
         )
         if world_rank in leaving:
             return
@@ -1521,7 +1569,11 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
 
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    rank_idx, num_ranks = init_test_environment(local_rank, num_local_ranks, args.seed)
+    num_nodes, node_rank = int(os.getenv("WORLD_SIZE", 1)), int(os.getenv("RANK", 0))
+    assert 0 <= node_rank < num_nodes and 0 <= local_rank < num_local_ranks
+    rank_idx = node_rank * num_local_ranks + local_rank
+    num_ranks = num_nodes * num_local_ranks
+    init_test_environment(local_rank, rank_idx, args.seed)
     # The job's Store, served by the rank 0 process for the whole run; every Store wait is bounded by `--store-timeout-secs`
     store = dist.TCPStore(
         os.getenv("SERVER_ADDR", "127.0.0.1"),
@@ -1687,6 +1739,28 @@ def make_parser() -> argparse.ArgumentParser:
         help="inline JSON or JSON file of phases (lists of world ranks); default: a built-in plan",
     )
     parser.add_argument(
+        "--worker-ranks",
+        type=lambda value: [int(rank) for rank in value.split(",")],
+        help="comma-separated world ranks to launch here, in local GPU order, for one lifetime each",
+    )
+    parser.add_argument(
+        "--join-phase",
+        type=int,
+        default=0,
+        help="phase when this launcher's --worker-ranks join (default: 0)",
+    )
+    parser.add_argument(
+        "--expect-new-host",
+        action="store_true",
+        help="check that these returning workers use different hosts and GPUs and receive retained-graph traffic",
+    )
+    parser.add_argument(
+        "--max-scaleout-ranks",
+        type=int,
+        default=0,
+        help="maximum number of NVLink domains for independently launched --worker-ranks",
+    )
+    parser.add_argument(
         "--benchmark",
         action="store_true",
         help="CUDA-event call/pair timings in every phase (off by default)",
@@ -1764,6 +1838,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not 0 <= args.hot_rank_fraction <= 1:
         parser.error("--hot-rank-fraction must be between 0 and 1")
+    if args.worker_ranks is not None and not args.plan:
+        parser.error("--worker-ranks requires --plan")
+    if (
+        args.expect_new_host or args.join_phase or args.max_scaleout_ranks
+    ) and args.worker_ranks is None:
+        parser.error(
+            "--expect-new-host, --join-phase and --max-scaleout-ranks require --worker-ranks"
+        )
+    if args.worker_ranks is not None and (
+        args.ranks_per_domain or args.position_offset
+    ):
+        parser.error(
+            "--worker-ranks supplies public IDs directly; omit --ranks-per-domain and --position-offset"
+        )
+    if args.expect_new_host and args.join_phase <= 0:
+        parser.error("--expect-new-host requires a later --join-phase")
     assert (
         not args.profile or os.environ.get("NIXL_EP_ADAPTIVE_PROFILE") == "1"
     ), "--profile requires NIXL_EP_ADAPTIVE_PROFILE=1 before launch"
@@ -1774,9 +1864,14 @@ if __name__ == "__main__":
         from process_plan import run_process_plan
 
         plan = load_plan(args.plan)
-        size = int(os.getenv("WORLD_SIZE", 1)) * args.num_processes
-        if args.num_processes < 1 or size < 1:
-            parser.error("The test needs at least one node and one GPU per node")
+        if args.num_processes < 1:
+            parser.error("--num-processes must be positive")
+        size = None
+        if args.worker_ranks is None:
+            num_nodes = int(os.getenv("WORLD_SIZE", 1))
+            if not 0 <= int(os.getenv("RANK", 0)) < num_nodes:
+                parser.error("RANK must identify a node in WORLD_SIZE")
+            size = num_nodes * args.num_processes
         world, max_so, max_su = process_placement(args, plan, size)
         if any(
             not 0 <= int(p) < len(plan)
