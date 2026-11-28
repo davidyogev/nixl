@@ -590,8 +590,8 @@ def validate_plan(
             assert set(phase) <= set(
                 present
             ), f"Phase {phase} names ranks that are not in the job {present}"
-        if phase_idx == 0:
-            case.buffer._masks_of(phase)  # Future joiners are checked after connection.
+        if case.args.keep_connected or phase_idx == 0:
+            case.buffer._masks_of(phase)
 
 
 def check_expanded_dispatch(
@@ -1267,15 +1267,19 @@ def switch_world(
     phase: List[int],
     barrier_fn: Callable[[], None],
     store_timeout_secs: float,
+    reconnect_on_leave: bool,
 ) -> None:
-    """Drain resident workers, connect joining peers and retire peers that leave."""
+    """Update resident workers' membership, optionally reconnecting peers on rejoin."""
     buffer.barrier(with_cpu_sync=True)
     barrier_fn()
     me = buffer.world_rank
     active = me in phase
+    update_membership = active or (
+        not reconnect_on_leave and me in buffer.get_active_ranks()
+    )
     connected = set(buffer.get_connected_ranks())
     needed = (set(phase) - {me}) if active else set()
-    joining = sorted(needed - connected)
+    joining = sorted(needed - connected) if reconnect_on_leave else []
     if joining:
         buffer.connect_ranks(
             joining,
@@ -1284,11 +1288,11 @@ def switch_world(
         )
     torch.cuda.synchronize()
     barrier_fn()
-    if active:
+    if update_membership:
         buffer.set_active_ranks(phase)
     torch.cuda.synchronize()
     barrier_fn()
-    if active:
+    if update_membership:
         assert buffer.get_active_ranks() == sorted(phase)
         expected = expected_mode(
             phase, buffer.max_num_scaleup_ranks, rank_mapping(buffer)
@@ -1297,13 +1301,15 @@ def switch_world(
             buffer._get_mode() == expected
         ), f"the host derived {buffer._get_mode()} for {phase}, expected {expected}"
 
-    # Participants retire excluded peers; departing buffers retire all peers and remain singletons.
-    leaving = sorted(connected - needed)
+    leaving = sorted(connected - needed) if reconnect_on_leave else []
     if leaving:
         buffer.disconnect_ranks(leaving)
     torch.cuda.synchronize()
     barrier_fn()
-    if not active:
+    if not reconnect_on_leave:
+        assert set(buffer.get_connected_ranks()) == connected
+        assert (me in buffer.get_active_ranks()) == active
+    elif not active:
         assert buffer.get_active_ranks() == [me]
         assert not buffer.get_connected_ranks()
 
@@ -1632,7 +1638,9 @@ def run_resident_worker(
 
     graph = GraphCase(case, present, {rank: present for rank in present}, barrier)
     for phase_idx, phase in enumerate(plan):
-        switch_world(buffer, phase, barrier, args.store_timeout_secs)
+        switch_world(
+            buffer, phase, barrier, args.store_timeout_secs, args.reconnect_on_leave
+        )
         if phase_idx == 0:
             graph.capture()
         if me in phase:
@@ -1643,7 +1651,9 @@ def run_resident_worker(
     graph.release()
 
     # Back to the full world (the host derives its mode) before tearing down
-    switch_world(buffer, present, barrier, args.store_timeout_secs)
+    switch_world(
+        buffer, present, barrier, args.store_timeout_secs, args.reconnect_on_leave
+    )
     save_error = None
     if args.save_output:
         save_error = save_results(
@@ -1715,7 +1725,8 @@ def make_parser() -> argparse.ArgumentParser:
         description="Adaptive EP kernels: elastic membership on the NIXL transport"
     )
     add_common_arguments(parser)
-    parser.add_argument(
+    plans = parser.add_mutually_exclusive_group()
+    plans.add_argument(
         "--plan",
         type=str,
         default="",
@@ -1792,10 +1803,15 @@ def make_parser() -> argparse.ArgumentParser:
         help="print phase boundaries for each eager pair and graph replay; "
         "requires NIXL_EP_ADAPTIVE_PROFILE set to 1",
     )
-    parser.add_argument(
+    plans.add_argument(
+        "--keep-connected",
+        action="store_true",
+        help="keep idle workers, buffers, and peer connections alive (built-in plan only)",
+    )
+    plans.add_argument(
         "--reconnect-on-leave",
         action="store_true",
-        help="keep workers alive through the built-in plan and reconnect their existing buffers on rejoin",
+        help="keep idle workers and buffers alive, disconnect peers on leave and reconnect on rejoin (built-in plan only)",
     )
     parser.add_argument("--num-cpu-timeout-secs", type=int, default=100)
     parser.add_argument(
@@ -1845,11 +1861,9 @@ if __name__ == "__main__":
         parser.error(
             "--ranks-per-domain describes the allocation for an explicit --plan"
         )
-    if args.reconnect_on_leave and args.plan:
-        parser.error("--reconnect-on-leave applies only to the built-in plan")
     if args.num_processes < 1:
         parser.error("--num-processes must be positive")
-    if args.reconnect_on_leave:
+    if args.keep_connected or args.reconnect_on_leave:
         torch.multiprocessing.spawn(
             run_resident_worker,
             args=(args.num_processes, args),

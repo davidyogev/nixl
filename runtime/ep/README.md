@@ -284,9 +284,9 @@ buffers and exit. Each phase checks eager execution and replay with both the
 original routing and routing for the new membership. A returning rank starts
 a fresh process. Each membership must form a product of domains and positions.
 
-If phase 0 spans the allocation, its workers discover the physical domain
-sizes. For a partial start, the test reserves capacity without probing future
-GPUs. Specify `--ranks-per-domain` for a domain spanning nodes or for a
+With an explicit plan that starts on the full allocation, the initial workers
+discover the physical domain sizes by default. For a partial start, the test
+reserves capacity without probing future GPUs. Specify `--ranks-per-domain` for a domain spanning nodes or for a
 partially occupied domain. The default is the GPUs per node, capped at
 `--max-scaleup-ranks` when supplied. The runtime discovers actual peer connectivity.
 
@@ -311,10 +311,15 @@ their host boot IDs and GPU UUIDs changed and that their new buffers received
 tokens from survivors replaying their original graphs. The two maximum
 dimensions reserve capacity for either one four-GPU domain or two two-GPU domains.
 
-The built-in plan discovers the full allocation and tests shrink and expansion
-with fresh processes for returning ranks. To test a returning worker replaying
-its own original graph, use `--reconnect-on-leave` with the built-in plan.
-This keeps idle workers alive and reconnects their existing buffers.
+By default, the built-in plan uses temporary processes to discover the NVLink
+topology and starts fresh workers for returning ranks. It also offers two
+mutually exclusive options that keep idle workers, buffers and CUDA graphs alive.
+
+- `--keep-connected` keeps peer connections open while a rank is inactive.
+- `--reconnect-on-leave` disconnects peers on leave and reconnects them on rejoin.
+
+Both options apply only to the built-in plan. The test rejects either option
+when combined with `--plan`.
 
 ## Phase profiling
 
