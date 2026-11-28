@@ -88,7 +88,7 @@ run_runtime_ep_test --plan '[[0,1],[0,1,2,3]]' --dtype fp8
 #   3. Direct/hybrid topology coverage: 2x2, default plan
 #      [[0,1,2,3],[0,1],[0,1,2,3],[0,2],[0,1,2,3],[1,3],[0,1,2,3],[2,3],[0,1,2,3],[0],[0,1,2,3]]
 #   4. Late join domain, domain replacement, mode switch with the same number of GPUs and a 1-GPU phase:
-#      2x2, [[0,1],[0,1,2,3],[0,1],[2,3],[0,2],[3],[0,1]] --reconnect-on-leave
+#      2x2, [[0,1],[0,1,2,3],[0,1],[2,3],[0,2],[3],[0,1]]
 #      --num-topk 6 --num-tokens 63 --num-experts 96
 #   5. Short hybrid NVFP4 expansion: 2x2, [[0,2],[0,1,2,3]] --dtype nvfp4 (replaces test 3)
 #   6. Short hybrid FP8 expansion: 2x2, [[0,2],[0,1,2,3]] --dtype fp8 (replaces test 4)

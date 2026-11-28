@@ -8,8 +8,8 @@ Test elastic membership of adaptive EP kernels over NIXL (RDMA and NVLink).
 The host derives each phase's kernel mode from the active topology: direct when
 exactly one NVLink domain is active, hybrid when multiple domains are active.
 A plan scales membership up and down through lists of public world ranks; their
-discovered slots must form a product of NVLink domains and positions. Explicit
-plans launch and retire GPU processes as the membership changes.
+discovered slots must form a product of NVLink domains and positions. By default,
+departing GPU processes exit and returning ranks start fresh processes.
 
 Each active rank checks eager dispatch/combine and retained CUDA-graph replay.
 The test also exercises buffer setup, peer connections, membership updates and
@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, 
 import torch
 import torch.distributed as dist
 from buffer_setup import rank_coordinates, rank_mapping, topology_experts
+from process_plan import process_store, run_process_plan
 
 import nixl.runtime.ep as runtime_ep
 from nixl.runtime.ep.utils.math import calc_diff, per_token_cast_to_fp8
@@ -141,6 +142,16 @@ def process_placement(args, plan, size):
             f"Plan names ranks {sorted(missing)} outside {world}; check --ranks-per-domain and --position-offset"
         )
     return world, max_so, max_su
+
+
+def discover_default_width(local_rank, size, args):
+    # A short-lived probe keeps CUDA contexts off the supervisor when workers exit.
+    torch.cuda.set_device(local_rank)
+    index = int(os.getenv("RANK", "0")) * args.num_processes + local_rank
+    store = process_store(args)
+    cohort = NixlBootstrap(store, index, size, timeout_seconds=args.store_timeout_secs)
+    if index == 0:
+        store.set("default-width", str(cohort.num_scaleup_ranks))
 
 
 def resolve_initial_geometry(store, plan, world_rank, start_phase, args):
@@ -579,9 +590,7 @@ def validate_plan(
             assert set(phase) <= set(
                 present
             ), f"Phase {phase} names ranks that are not in the job {present}"
-        if (phase_idx == 0 or not case.args.reconnect_on_leave) and set(
-            phase
-        ) <= rank_mapping(case.buffer).keys():
+        if phase_idx == 0:
             case.buffer._masks_of(phase)  # Future joiners are checked after connection.
 
 
@@ -1258,26 +1267,14 @@ def switch_world(
     phase: List[int],
     barrier_fn: Callable[[], None],
     store_timeout_secs: float,
-    reconnect_on_leave: bool = False,
 ) -> None:
-    """
-    Drain the old world, activate participants and optionally retire peers; `barrier_fn` spans all processes.
-    With reconnection, departing buffers return to a singleton and participation follows `phase`.
-    Otherwise departing ranks adopt `phase` to become inactive while retaining connections.
-    `store_timeout_secs` bounds the Store wait of `connect_ranks`.
-    """
+    """Drain resident workers, connect joining peers and retire peers that leave."""
     buffer.barrier(with_cpu_sync=True)
     barrier_fn()
     me = buffer.world_rank
     active = me in phase
-    update_membership = active or (
-        not reconnect_on_leave and me in buffer.get_active_ranks()
-    )
     connected = set(buffer.get_connected_ranks())
-    if reconnect_on_leave:
-        needed = (set(phase) - {me}) if active else set()
-    else:
-        needed = connected | ((set(phase) - {me}) if active else set())
+    needed = (set(phase) - {me}) if active else set()
     joining = sorted(needed - connected)
     if joining:
         buffer.connect_ranks(
@@ -1287,13 +1284,11 @@ def switch_world(
         )
     torch.cuda.synchronize()
     barrier_fn()
-    if update_membership:
+    if active:
         buffer.set_active_ranks(phase)
     torch.cuda.synchronize()
     barrier_fn()
-    if not reconnect_on_leave:
-        assert (me in buffer.get_active_ranks()) == active
-    if update_membership:
+    if active:
         assert buffer.get_active_ranks() == sorted(phase)
         expected = expected_mode(
             phase, buffer.max_num_scaleup_ranks, rank_mapping(buffer)
@@ -1303,12 +1298,12 @@ def switch_world(
         ), f"the host derived {buffer._get_mode()} for {phase}, expected {expected}"
 
     # Participants retire excluded peers; departing buffers retire all peers and remain singletons.
-    leaving = sorted(connected - needed) if reconnect_on_leave else []
+    leaving = sorted(connected - needed)
     if leaving:
         buffer.disconnect_ranks(leaving)
     torch.cuda.synchronize()
     barrier_fn()
-    if reconnect_on_leave and not active:
+    if not active:
         assert buffer.get_active_ranks() == [me]
         assert not buffer.get_connected_ranks()
 
@@ -1447,13 +1442,7 @@ def check_replacement_traffic(case, graph, phase, survivors, num_recv):
 def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
     init_test_environment(local_rank, world_rank, args.seed)
     timeout = timedelta(seconds=args.store_timeout_secs)
-    store = dist.TCPStore(
-        os.getenv("SERVER_ADDR", "127.0.0.1"),
-        int(os.getenv("SERVER_PORT", "8361")),
-        world_size=None,
-        is_master=False,
-        timeout=timeout,
-    )
+    store = process_store(args)
     if args.worker_ranks is not None:
         location = worker_location(local_rank)
         key = f"last-location/{world_rank}"
@@ -1568,7 +1557,9 @@ def run_worker(local_rank, world_rank, start_phase, plan, max_so, max_su, args):
 
 
 @torch.inference_mode()
-def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+def run_resident_worker(
+    local_rank: int, num_local_ranks: int, args: argparse.Namespace
+):
     num_nodes, node_rank = int(os.getenv("WORLD_SIZE", 1)), int(os.getenv("RANK", 0))
     assert 0 <= node_rank < num_nodes and 0 <= local_rank < num_local_ranks
     rank_idx = node_rank * num_local_ranks + local_rank
@@ -1641,13 +1632,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     graph = GraphCase(case, present, {rank: present for rank in present}, barrier)
     for phase_idx, phase in enumerate(plan):
-        switch_world(
-            buffer,
-            phase,
-            barrier,
-            args.store_timeout_secs,
-            args.reconnect_on_leave,
-        )
+        switch_world(buffer, phase, barrier, args.store_timeout_secs)
         if phase_idx == 0:
             graph.capture()
         if me in phase:
@@ -1658,9 +1643,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     graph.release()
 
     # Back to the full world (the host derives its mode) before tearing down
-    switch_world(
-        buffer, present, barrier, args.store_timeout_secs, args.reconnect_on_leave
-    )
+    switch_world(buffer, present, barrier, args.store_timeout_secs)
     save_error = None
     if args.save_output:
         save_error = save_results(
@@ -1812,9 +1795,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reconnect-on-leave",
         action="store_true",
-        help="in the built-in plan, retire all peers while a rank sits out; reconnect may reassign internal "
-        "positions, so each phase must remain a product of domains and positions "
-        "(default: keep connections)",
+        help="keep workers alive through the built-in plan and reconnect their existing buffers on rejoin",
     )
     parser.add_argument("--num-cpu-timeout-secs", type=int, default=100)
     parser.add_argument(
@@ -1860,31 +1841,49 @@ if __name__ == "__main__":
     assert (
         args.position_offset == 0 or args.max_scaleup_ranks > 0
     ), "--position-offset needs --max-scaleup-ranks"
-    if args.plan:
-        from process_plan import run_process_plan
-
-        plan = load_plan(args.plan)
-        if args.num_processes < 1:
-            parser.error("--num-processes must be positive")
-        size = None
-        if args.worker_ranks is None:
-            num_nodes = int(os.getenv("WORLD_SIZE", 1))
-            if not 0 <= int(os.getenv("RANK", 0)) < num_nodes:
-                parser.error("RANK must identify a node in WORLD_SIZE")
-            size = num_nodes * args.num_processes
-        world, max_so, max_su = process_placement(args, plan, size)
+    if args.ranks_per_domain and not args.plan:
+        parser.error(
+            "--ranks-per-domain describes the allocation for an explicit --plan"
+        )
+    if args.reconnect_on_leave and args.plan:
+        parser.error("--reconnect-on-leave applies only to the built-in plan")
+    if args.num_processes < 1:
+        parser.error("--num-processes must be positive")
+    if args.reconnect_on_leave:
+        torch.multiprocessing.spawn(
+            run_resident_worker,
+            args=(args.num_processes, args),
+            nprocs=args.num_processes,
+        )
+    else:
+        node = int(os.getenv("RANK", 0))
+        num_nodes = int(os.getenv("WORLD_SIZE", 1))
+        size = num_nodes * args.num_processes
+        if args.worker_ranks is None and not 0 <= node < num_nodes:
+            parser.error("RANK must identify a node in WORLD_SIZE")
+        if args.plan:
+            plan = load_plan(args.plan)
+            world, max_so, max_su = process_placement(
+                args, plan, size if args.worker_ranks is None else None
+            )
+            store = None
+        else:
+            # The supervisor keeps the store across discovery and every GPU worker lifetime.
+            store = process_store(args, server=node == 0)
+            torch.multiprocessing.spawn(
+                discover_default_width, args=(size, args), nprocs=args.num_processes
+            )
+            width = int(store.get("default-width"))
+            max_su = args.max_scaleup_ranks or width
+            max_so = size // width
+            world = fixture_ranks(size, width, max_su, args.position_offset)
+            plan = default_plan(max_su, world)
         if any(
             not 0 <= int(p) < len(plan)
             for p in args.perf_phases.split(",")
             if p.strip()
         ):
             parser.error("--perf-phases names a phase outside the plan")
-        run_process_plan(args, plan, world, max_so, max_su, run_worker, write_results)
-    else:
-        if args.ranks_per_domain:
-            parser.error(
-                "--ranks-per-domain describes the allocation for an explicit --plan"
-            )
-        torch.multiprocessing.spawn(
-            test_loop, args=(args.num_processes, args), nprocs=args.num_processes
+        run_process_plan(
+            args, plan, world, max_so, max_su, run_worker, write_results, store=store
         )

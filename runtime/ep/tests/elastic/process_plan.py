@@ -13,7 +13,20 @@ import torch
 import torch.distributed as dist
 
 
-def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_results):
+def process_store(args, *, server=False):
+    return dist.TCPStore(
+        os.getenv("SERVER_ADDR", "127.0.0.1"),
+        int(os.getenv("SERVER_PORT", "8361")),
+        world_size=None,
+        is_master=server,
+        timeout=timedelta(seconds=args.store_timeout_secs),
+        wait_for_workers=False,
+    )
+
+
+def run_process_plan(
+    args, plan, world_ranks, max_so, max_su, worker, write_results, store=None
+):
     node = int(os.getenv("RANK", "0"))
     local = args.worker_ranks
     if local is None:
@@ -35,15 +48,8 @@ def run_process_plan(args, plan, world_ranks, max_so, max_su, worker, write_resu
     if node and not any(set(local).intersection(phase) for phase in plan):
         return
 
-    # The CPU supervisor owns the server even when GPU rank zero is absent.
-    store = dist.TCPStore(
-        os.getenv("SERVER_ADDR", "127.0.0.1"),
-        int(os.getenv("SERVER_PORT", "8361")),
-        world_size=None,
-        is_master=node == 0,
-        timeout=timedelta(seconds=args.store_timeout_secs),
-        wait_for_workers=False,
-    )
+    if store is None:
+        store = process_store(args, server=node == 0)
     spawn = multiprocessing.get_context("spawn")
     children = {}
 

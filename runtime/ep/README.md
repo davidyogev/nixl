@@ -276,9 +276,9 @@ not per-NIC bandwidth measurements. `--dtype` selects BF16, FP8 or NVFP4
 dispatch for checked and timed pairs, with matching buffer capacity.
 Payload values and scales are checked byte for byte; combine stays BF16.
 
-With an explicit plan, a CPU supervisor on each node starts GPU processes as
-their ranks join. For example, `--plan '[[0,1],[0,1,2,3],[0,1]]'` starts only
-ranks 0 and 1, captures their CUDA graphs, then starts 2 and 3. Ranks 0 and 1
+By default, a CPU supervisor on each node starts GPU processes as their ranks
+join and waits for departing workers to exit before advancing. For example,
+`--plan '[[0,1],[0,1,2,3],[0,1]]'` starts only ranks 0 and 1, captures their CUDA graphs, then starts 2 and 3. Ranks 0 and 1
 replay those same graphs after expansion and again after 2 and 3 destroy their
 buffers and exit. Each phase checks eager execution and replay with both the
 original routing and routing for the new membership. A returning rank starts
@@ -311,9 +311,10 @@ their host boot IDs and GPU UUIDs changed and that their new buffers received
 tokens from survivors replaying their original graphs. The two maximum
 dimensions reserve capacity for either one four-GPU domain or two two-GPU domains.
 
-The built-in plan keeps GPU processes alive and exercises membership changes
-on resident buffers. Use `--reconnect-on-leave` with that plan to retire and
-reconnect peers while retaining the idle ranks' graphs.
+The built-in plan discovers the full allocation and tests shrink and expansion
+with fresh processes for returning ranks. To test a returning worker replaying
+its own original graph, use `--reconnect-on-leave` with the built-in plan.
+This keeps idle workers alive and reconnects their existing buffers.
 
 ## Phase profiling
 
